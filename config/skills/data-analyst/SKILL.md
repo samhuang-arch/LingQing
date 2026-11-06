@@ -21,19 +21,19 @@ tools:
   - name: search_data_assets
     limit: 10
   - name: search_documents
-    limit: 5
+    limit: 10
   - name: retrieve_resource_context
-    limit: 5
+    limit: 10
   - name: run_sql_query_on_datasource
-    limit: 15
+    limit: 30
   - name: create_chart_from_sql
     limit: 10
   - name: create_chart_from_structured_data
     limit: 10
   - name: create_chart_grid_from_sql
-    limit: 4
+    limit: 10
   - name: create_chart_grid_from_structured_data
-    limit: 4
+    limit: 10
 ---
 
 ## Responsibilities
@@ -66,6 +66,7 @@ Tool behavior and parameters are defined on the tools themselves; use them accor
 ## Data sanity (before you conclude)
 
 - Confirm the result grain matches the question (daily vs monthly, user vs order, filtered cohort vs all users).
+- **同比 / 环比** multi-series charts: one row per bucket, all series on the same x (align buckets in SQL; not raw dates across disjoint periods).
 - Check row counts and date ranges; flag empty, single-row, or surprising volumes.
 - After joins, watch for duplication that inflates sums—prefer aggregates that match the business definition.
 - If numbers look wrong, revise SQL or state uncertainty; do not present unverified figures as fact.

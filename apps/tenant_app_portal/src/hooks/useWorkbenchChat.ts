@@ -6,7 +6,8 @@ import { useNotification } from '@/hooks/useNotification'
 import { useChatHistory } from '@/hooks/useChatHistory'
 import { useChatStream } from '@/hooks/useChatStream'
 import { shouldNavigateAfterStreamStart } from '@/lib/chatStream'
-import { isActiveRunStatus } from '@/lib/chatApi'
+import { cancelAgentRun, isActiveRunStatus } from '@/lib/chatApi'
+import { getApiErrorMessage } from '@/lib/api'
 import { isStreamTransportError } from '@/lib/streamErrors'
 import type { ArtifactsAutoOpenPreference, ThinkingEffort } from '@/lib/userPreferencesTypes'
 import {
@@ -21,6 +22,8 @@ import type { Artifact, AttachedArtifact, Message } from '@/types'
 interface UseWorkbenchChatOptions {
   agentId: number
   threadId: string | null
+  /** When false, skips history fetch (e.g. route metadata already failed). */
+  historyEnabled?: boolean
   createThread: (params: { agentId: number }) => Promise<{ id: string }>
   navigate: (path: string, options?: { replace?: boolean }) => void
   updateThreadTitle: (params: { threadId: string; title: string }) => void
@@ -48,6 +51,7 @@ function withOptimisticMessage(history: Message[], optimistic: Message | null): 
 export function useWorkbenchChat({
   agentId,
   threadId,
+  historyEnabled = true,
   createThread,
   navigate,
   updateThreadTitle,
@@ -62,8 +66,9 @@ export function useWorkbenchChat({
 }: UseWorkbenchChatOptions) {
   const { t } = useTranslation()
   const { user } = useAuth()
-  const { showError } = useNotification()
+  const { showError, showInfo } = useNotification()
   const latestMessageTimestampBeforeSendRef = useRef(0)
+  const activeRunIdRef = useRef<string | null>(null)
   const hitlContinueProposalRef = useRef<string | null>(null)
   const handleStreamEventRef = useRef<(data: SSEMessage, activeThreadId: string) => Promise<void>>(
     async () => {}
@@ -77,7 +82,7 @@ export function useWorkbenchChat({
     loadError: threadLoadError,
     loadMore,
     refreshTail,
-  } = useChatHistory(agentId, threadId || undefined, !!threadId)
+  } = useChatHistory(agentId, threadId || undefined, !!threadId && historyEnabled)
 
   const {
     optimisticMessage,
@@ -89,12 +94,14 @@ export function useWorkbenchChat({
     runHitlResumeStream,
     resetStreamState,
     failStream,
+    abortActiveStream,
   } = useChatStream({
     threadId,
     onEvent: (data, activeThreadId) => handleStreamEventRef.current(data, activeThreadId),
   })
 
   const {
+    activeRun,
     isAgentWorking,
     notifyStreamStarted,
     notifyStreamFinished,
@@ -131,6 +138,17 @@ export function useWorkbenchChat({
   handleStreamEventRef.current = async (data, activeThreadId) => {
     switch (data.type) {
       case 'session_started': {
+        if ('run_id' in data && data.run_id) {
+          activeRunIdRef.current = data.run_id
+        }
+        await refreshTail()
+        return
+      }
+      case 'cancelled': {
+        notifyStreamFinished()
+        resetStreamState()
+        activeRunIdRef.current = null
+        showInfo(t('workbench.generationStopped'))
         await refreshTail()
         return
       }
@@ -365,6 +383,36 @@ export function useWorkbenchChat({
     await refreshTail()
   }, [notifyStreamFinished, refreshTail])
 
+  const handleStopGeneration = useCallback(async () => {
+    if (!threadId || !showWorkingIndicator) return
+    const runId = activeRunIdRef.current ?? activeRun?.run_id ?? null
+    if (!runId) return
+    try {
+      await cancelAgentRun(threadId, runId)
+      abortActiveStream()
+      notifyStreamFinished()
+      resetStreamState()
+      activeRunIdRef.current = null
+      showInfo(t('workbench.generationStopped'))
+      await refreshTail()
+      void refreshStatus()
+    } catch (error) {
+      showError(getApiErrorMessage(error, t('workbench.stopFailed')))
+    }
+  }, [
+    abortActiveStream,
+    activeRun?.run_id,
+    notifyStreamFinished,
+    refreshStatus,
+    refreshTail,
+    resetStreamState,
+    showError,
+    showInfo,
+    showWorkingIndicator,
+    t,
+    threadId,
+  ])
+
   return {
     displayMessages,
     historyLoading,
@@ -381,5 +429,6 @@ export function useWorkbenchChat({
     handleSendMessage,
     handleHitlApprovedContinue,
     handleHitlRejected,
+    handleStopGeneration,
   }
 }

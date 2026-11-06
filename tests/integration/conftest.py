@@ -160,7 +160,7 @@ def pg_container():
     import socket
     import time
 
-    from testcontainers.postgres import PostgresContainer
+    from testcontainers.community.postgres import PostgresContainer
 
     _ensure_docker_host()
     with PostgresContainer("postgres:16-alpine") as pg:
@@ -287,6 +287,23 @@ async def async_db_session(pg_async_db_session):
     Integration tests should use PostgreSQL-backed sessions.
     """
     yield pg_async_db_session
+
+
+@pytest.fixture(autouse=True)
+def route_app_db_session_to_integration(pg_async_db_session, monkeypatch):
+    """Route ``app_db_session()`` to the per-test Postgres session (agent port + turns)."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def routed_app_db_session():
+        yield pg_async_db_session
+
+    for module_path in (
+        "apps.shared.db.session.app_db_session",
+        "apps.tenant_app_service.chat.infrastructure.adapters.agent_run_port_adapter.app_db_session",
+        "apps.tenant_app_service.chat.turn_db.app_db_session",
+    ):
+        monkeypatch.setattr(module_path, routed_app_db_session)
 
 
 # ─── Shared data fixtures ──────────────────────────────────────────────────────

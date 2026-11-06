@@ -1,21 +1,21 @@
 """Chat module for agent interactions and thread management.
 
-Layer map (inward dependencies only):
+Layer map (see ``AGENTS.md`` — DDD four layers):
 
-- ``application/`` — **Application** orchestration (multi-session entry: HTTP stream, headless).
-- ``turn_service``, ``thread_service``, ``thread_run_service`` —
-  **Application Services** (one ``AsyncSession`` per call).
-- ``turn_admission`` — Postgres advisory lock + busy gate (prepare transaction).
-- ``domain``, ``agent_run_domain`` — Pure domain types and rules (no I/O).
-- ``*_repository`` — Persistence adapters.
-- ``streaming`` — SSE transport only.
-- ``schemas`` — HTTP/DTO contracts.
+- **Presentation:** ``schemas`` (DTOs); routers live under ``tenant_app_service/routers``.
+- **Application:** ``application/`` — ``turn/``, ``runs/``, ``threads/``, ``turn_flow``, ``queries/``.
+- **Domain:** ``domain/`` — aggregates, policies, ``ports/``.
+- **Infrastructure:** ``infrastructure/persistence/``, ``infrastructure/adapters/``.
 
-Routers and ingress import ``application`` for turns; not ``ChatTurnService`` directly for streaming.
+Legacy import paths (``thread_run_service``, ``turn_service``, adapters at package root) re-export from the layers above.
+Composition helpers: ``chat.deps``.
 """
 
+from apps.tenant_app_service.chat.application.runs import ThreadRunService
+from apps.tenant_app_service.chat.application.threads import ThreadService
+from apps.tenant_app_service.chat.application.turn import ChatTurnService
 from apps.tenant_app_service.chat.domain import MessageDomain, ThreadDomain
-from apps.tenant_app_service.chat.repository import ThreadRepository
+from apps.tenant_app_service.chat.infrastructure.persistence.thread_repository import ThreadRepository
 from apps.tenant_app_service.chat.schemas import (
     ChatRequest,
     ChatResponse,
@@ -24,11 +24,10 @@ from apps.tenant_app_service.chat.schemas import (
     ThreadResponse,
     ThreadUpdate,
 )
-from apps.tenant_app_service.chat.thread_service import ThreadService
-from apps.tenant_app_service.chat.turn_service import ChatTurnService
 
 __all__ = [
     "ChatTurnService",
+    "ThreadRunService",
     "ThreadService",
     "MessageDomain",
     "ThreadDomain",

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.tenant_app_service.chat.agent_run_message_repository import AgentRunMessageRepository
-from apps.tenant_app_service.chat.main_message_repository import MainMessageRepository
+from apps.tenant_app_service.chat.infrastructure.persistence import (
+    AgentRunMessageRepository,
+    MainMessageRepository,
+)
 
 
 async def resolve_latest_ai_message_id_for_session(
@@ -22,6 +24,14 @@ async def resolve_latest_ai_message_id_for_session(
     run_repo = AgentRunMessageRepository(db)
     run_ai = await run_repo.get_latest_ai_message_for_session(thread_id, session_id)
     return run_ai.message_id if run_ai and run_ai.message_id else None
+
+
+async def feedback_message_id_exists(db: AsyncSession, message_id: str) -> bool:
+    main_repo = MainMessageRepository(db)
+    if await main_repo.get_by_message_id_only(message_id):
+        return True
+    run_repo = AgentRunMessageRepository(db)
+    return await run_repo.get_message_by_message_id(message_id) is not None
 
 
 async def update_message_metadata_for_feedback(

@@ -4,23 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from apps.shared.core.exceptions import ValidationError
 from apps.shared.schemas.user import UserDTO
-from uuid import uuid4
-
-from apps.tenant_app_service.chat.agent_run_domain import AgentRunDomain, AgentRunStatus
+from apps.tenant_app_service.chat.domain import AgentRunDomain, AgentRunStatus
+from apps.tenant_app_service.chat.application import iter_prepared_chat_stream_committed
 from apps.tenant_app_service.chat.schemas import ChatRequest, SimpleMessage
 from apps.tenant_app_service.chat.thread_service import ThreadService
 from apps.tenant_app_service.chat.turn_service import ChatTurnService
-from apps.tenant_app_service.chat.application import iter_prepared_chat_stream_committed
 
 
 async def _committed_stream(chat_service, chat_request, current_user, access_token=None):
@@ -55,11 +53,11 @@ def _mock_send_human_and_runs(agent_id: int = -1, thread_id: str = "thread-1"):
     ]
 
 from apps.tenant_app_service.chat.streaming import (
-    PreparedChatStream,
     SSE_HEARTBEAT_PAYLOAD,
     STREAM_ERROR_KIND_DOMAIN,
     STREAM_ERROR_KIND_RATE_LIMIT,
     STREAM_ERROR_KIND_TIMEOUT,
+    PreparedChatStream,
     format_user_stream_error,
     is_transient_postgres_connection_error,
     stream_error_kind,
@@ -79,7 +77,7 @@ def _parse_sse_data_payloads(chunks: list[str]) -> list[dict]:
 @pytest.fixture(autouse=True)
 def _noop_thread_turn_guard():
     with patch(
-        "apps.tenant_app_service.chat.turn_service.guard_thread_turn_start",
+        "apps.tenant_app_service.chat.application.turn.prepare_complete.guard_thread_turn_start",
         AsyncMock(),
     ):
         yield
@@ -89,7 +87,7 @@ def _noop_thread_turn_guard():
 def chat_service():
     db = MagicMock()
     with patch(
-        "apps.tenant_app_service.chat.turn_service.ThreadService.get_thread",
+        "apps.tenant_app_service.chat.application.turn.base.ThreadService.get_thread",
         AsyncMock(return_value=SimpleNamespace(agent_id=-1)),
     ):
         service = ChatTurnService(tenant_id=1, db=db)
@@ -152,7 +150,7 @@ async def test_chat_stream_persists_before_session_started(chat_service, chat_re
         call_order.append("send_human")
         return _mock_send_human_and_runs(agent_id=chat_request.agent_id, thread_id=chat_request.thread_id)
 
-    async def fake_run_agent_and_emit(**kwargs):
+    async def fake_run_agent_and_emit(*_args, **kwargs):
         call_order.append("background")
         background_started.set()
         await kwargs["event_queue"].put('data: {"type":"done","session_id":"x"}\n\n')
@@ -178,12 +176,18 @@ async def test_chat_stream_persists_before_session_started(chat_service, chat_re
         patch.object(chat_service, "_cancel_superseded_hitl_if_needed", AsyncMock()),
         patch.object(chat_service, "_reconcile_active_runs_before_new_turn", AsyncMock()),
         patch(
-            "apps.tenant_app_service.chat.turn_service.ThreadRunService.send_human_and_create_runs",
+            "apps.tenant_app_service.chat.application.turn.prepare_complete.ThreadRunService.send_human_and_create_runs",
             side_effect=track_send,
         ),
         patch.object(chat_service, "create_thread_title_if_1st_message", AsyncMock(return_value=None)),
-        patch.object(ChatTurnService, "run_agent_and_emit_prepared", side_effect=fake_run_agent_and_emit),
-        patch("apps.tenant_app_service.chat.turn_service.AgentRunRepository.set_status", AsyncMock()),
+        patch(
+            "apps.tenant_app_service.chat.application.turn_flow.emit_prepared_agent_stream",
+            side_effect=fake_run_agent_and_emit,
+        ),
+        patch(
+            "apps.tenant_app_service.chat.application.turn.prepare_complete.ThreadRunService.mark_run_running",
+            AsyncMock(),
+        ),
     ):
         events = []
         async for item in _committed_stream(chat_service, chat_request, current_user):
@@ -198,7 +202,7 @@ async def test_chat_stream_persists_before_session_started(chat_service, chat_re
 async def test_chat_stream_sse_disconnect_leaves_background_running(chat_service, chat_request, current_user):
     background_started = asyncio.Event()
 
-    async def fake_run_agent_and_emit(**kwargs):
+    async def fake_run_agent_and_emit(*_args, **kwargs):
         background_started.set()
         await asyncio.Event().wait()
 
@@ -222,12 +226,18 @@ async def test_chat_stream_sse_disconnect_leaves_background_running(chat_service
         patch.object(chat_service, "_cancel_superseded_hitl_if_needed", AsyncMock()),
         patch.object(chat_service, "_reconcile_active_runs_before_new_turn", AsyncMock()),
         patch(
-            "apps.tenant_app_service.chat.turn_service.ThreadRunService.send_human_and_create_runs",
+            "apps.tenant_app_service.chat.application.turn.prepare_complete.ThreadRunService.send_human_and_create_runs",
             AsyncMock(return_value=_mock_send_human_and_runs()),
         ),
         patch.object(chat_service, "create_thread_title_if_1st_message", AsyncMock(return_value=None)),
-        patch.object(ChatTurnService, "run_agent_and_emit_prepared", side_effect=fake_run_agent_and_emit),
-        patch("apps.tenant_app_service.chat.turn_service.AgentRunRepository.set_status", AsyncMock()),
+        patch(
+            "apps.tenant_app_service.chat.application.turn_flow.emit_prepared_agent_stream",
+            side_effect=fake_run_agent_and_emit,
+        ),
+        patch(
+            "apps.tenant_app_service.chat.application.turn.prepare_complete.ThreadRunService.mark_run_running",
+            AsyncMock(),
+        ),
     ):
 
         async def consume_stream():
@@ -249,7 +259,7 @@ async def test_chat_stream_delivers_background_events(chat_service, chat_request
 
     background_started = asyncio.Event()
 
-    async def fake_run_agent_and_emit(**kwargs):
+    async def fake_run_agent_and_emit(*_args, **kwargs):
         background_started.set()
         await kwargs["event_queue"].put('data: {"type":"done","session_id":"x"}\n\n')
         await kwargs["event_queue"].put(None)
@@ -274,12 +284,18 @@ async def test_chat_stream_delivers_background_events(chat_service, chat_request
         patch.object(chat_service, "_cancel_superseded_hitl_if_needed", AsyncMock()),
         patch.object(chat_service, "_reconcile_active_runs_before_new_turn", AsyncMock()),
         patch(
-            "apps.tenant_app_service.chat.turn_service.ThreadRunService.send_human_and_create_runs",
+            "apps.tenant_app_service.chat.application.turn.prepare_complete.ThreadRunService.send_human_and_create_runs",
             AsyncMock(return_value=_mock_send_human_and_runs()),
         ),
         patch.object(chat_service, "create_thread_title_if_1st_message", AsyncMock(return_value=None)),
-        patch.object(ChatTurnService, "run_agent_and_emit_prepared", side_effect=fake_run_agent_and_emit),
-        patch("apps.tenant_app_service.chat.turn_service.AgentRunRepository.set_status", AsyncMock()),
+        patch(
+            "apps.tenant_app_service.chat.application.turn_flow.emit_prepared_agent_stream",
+            side_effect=fake_run_agent_and_emit,
+        ),
+        patch(
+            "apps.tenant_app_service.chat.application.turn.prepare_complete.ThreadRunService.mark_run_running",
+            AsyncMock(),
+        ),
     ):
         chunks = []
         async for item in _committed_stream(chat_service, chat_request, current_user):
@@ -302,7 +318,7 @@ async def test_chat_stream_emits_heartbeat_while_agent_is_idle(chat_service, cha
         thread_title=None,
     )
 
-    async def fake_run_agent_and_emit(**kwargs):
+    async def fake_run_agent_and_emit(*_args, **kwargs):
         await asyncio.Event().wait()
 
     chunks: list[str] = []
@@ -324,7 +340,10 @@ async def test_chat_stream_emits_heartbeat_while_agent_is_idle(chat_service, cha
             "apps.tenant_app_service.chat.application.turn_flow.with_chat_service",
             side_effect=_with_same_service,
         ),
-        patch.object(ChatTurnService, "run_agent_and_emit_prepared", side_effect=fake_run_agent_and_emit),
+        patch(
+            "apps.tenant_app_service.chat.application.turn_flow.emit_prepared_agent_stream",
+            side_effect=fake_run_agent_and_emit,
+        ),
         patch(
             "apps.tenant_app_service.chat.streaming.SSE_HEARTBEAT_INTERVAL_SECONDS",
             0.05,

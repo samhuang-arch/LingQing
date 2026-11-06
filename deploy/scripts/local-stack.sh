@@ -16,7 +16,7 @@ ENV_TEMPLATE="$DEPLOY_ROOT/env/.env.template"
 E2E_POSTGRES_HOST_PORT=5433
 E2E_GATEWAY_HOST_PORT=18080
 COMPOSE_CMD=""
-INFRA_SERVICES=(postgres chroma)
+INFRA_SERVICES=(postgres chroma egress-proxy)
 APP_SERVICES=(
     tenant-app-service
     tenant-manager-service
@@ -132,20 +132,14 @@ status_code() {
 }
 
 resolve_infra_services() {
-    local env_file="${1:-$ENV_FILE_DEV}"
-    INFRA_SERVICES=(postgres chroma)
-    local parser enabled
-    parser="$(read_env_or_default DOCUMENT_PARSER default "$env_file")"
-    enabled="$(read_env_or_default DOCLING_ENABLED false "$env_file")"
-    if [[ "$parser" == "docling" || "$enabled" == "true" ]]; then
-        INFRA_SERVICES+=(docling-serve)
-    fi
+    # Docling sidecar is required for the default parser; dev/E2E infra always starts it.
+    INFRA_SERVICES=(postgres chroma egress-proxy docling-serve)
 }
 
 infra_up() {
     (cd "$PROJECT_ROOT" && npm run -s link-dev-skills)
     resolve_infra_services "$ENV_FILE_DEV"
-    run_compose_dev build sandbox-runner-image
+    run_compose_dev build sandbox-runner-image egress-proxy
     ensure_sandbox_runner_image
     run_compose_dev up -d "${INFRA_SERVICES[@]}"
     POSTGRES_CONTAINER=lingqing-postgres db_init
@@ -157,11 +151,9 @@ infra_up() {
     echo "Dev infra started. Local connection info:"
     echo "  PostgreSQL: host=localhost port=${pg_port}"
     echo "  Chroma:     host=localhost port=8002"
-    if [[ " ${INFRA_SERVICES[*]} " == *" docling-serve "* ]]; then
-        local docling_port
-        docling_port="$(read_env_or_default DOCLING_HOST_PORT 5001 "$ENV_FILE_DEV")"
-        echo "  Docling:    http://127.0.0.1:${docling_port}/ui"
-    fi
+    local docling_port
+    docling_port="$(read_env_or_default DOCLING_HOST_PORT 5001 "$ENV_FILE_DEV")"
+    echo "  Docling:    http://127.0.0.1:${docling_port}/ui"
     echo "  Sandbox:    run 'npm run dev:ta' to start sandbox-controller locally (port 8090)"
 }
 
@@ -194,7 +186,7 @@ infra_down() {
 stack_up() {
     ensure_e2e_env
     resolve_infra_services "$ENV_FILE_E2E"
-    run_compose_e2e build backend-base backend-app-image
+    run_compose_e2e build backend-base backend-app-image egress-proxy
     run_compose_e2e build sandbox-runner-image sandbox-controller
     run_compose_e2e up -d "${INFRA_SERVICES[@]}"
     POSTGRES_CONTAINER=lingqing-e2e-postgres db_init
@@ -438,6 +430,7 @@ run_smoke() {
         "lingqing-e2e-tenant-manager-service"
         "lingqing-e2e-scheduler-service"
         "lingqing-e2e-gateway-service"
+        "lingqing-e2e-egress-proxy"
     )
     
     for name in "${required[@]}"; do

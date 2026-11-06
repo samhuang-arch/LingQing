@@ -24,7 +24,6 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from sqlalchemy.ext.asyncio import AsyncSession
 from typing_extensions import NotRequired, TypedDict
 
 from apps.shared.utils.logger import get_logger
@@ -37,13 +36,16 @@ from apps.tenant_app_service.agents.domain import (
     ToolCache,
     ToolCallCounts,
 )
-from apps.tenant_app_service.agents.memory.conversation_memory_manager import ConversationMemoryManager
+from apps.tenant_app_service.agents.hitl_message import is_hitl_approval_request
+from apps.tenant_app_service.agents.memory.agent_run_summary_service import compact_prepared_messages
 from apps.tenant_app_service.agents.message_content import ensure_visible_ai_content
 from apps.tenant_app_service.agents.message_preparer import MessagePreparer
 from apps.tenant_app_service.agents.metrics import llm_call_tracker
 from apps.tenant_app_service.agents.model_binding_manager import ModelBindingManager
+from apps.tenant_app_service.agents.ports.agent_run_port import AgentRunPort
+from apps.tenant_app_service.agents.ports.resolve_agent_run_port import resolve_agent_run_port
+from apps.tenant_app_service.agents.ports.run_scope import AgentRunScope
 from apps.tenant_app_service.agents.tool_executor import ToolExecutor
-from apps.tenant_app_service.hitl.utils import is_hitl_approval_request
 
 
 class AgentState(TypedDict):
@@ -55,6 +57,7 @@ class AgentState(TypedDict):
     tool_cache: NotRequired[ToolCache]
     skill_state: NotRequired[SkillState]  # Skill runtime state
     tool_limit_blocked: NotRequired[bool]  # True after a tool hit its limit; one text-only LLM turn then stop
+    run_cancelled: NotRequired[bool]  # User/agent run stop; route to save_messages
 
 
 class AgentBase(ABC):
@@ -130,34 +133,60 @@ class AgentBase(ABC):
             raise ValidationError("configurable.run_id is required for conversation persistence")
         return str(run_id)
 
-    def _get_or_create_manager(
-        self,
-        runtime: "AgentRuntimeContext",
-        db_session: AsyncSession,
-        *,
-        run_id: str,
-    ) -> ConversationMemoryManager:
-        """Create a new ConversationMemoryManager bound to one agent run.
+    @staticmethod
+    def _require_agent_run_port(config: RunnableConfig) -> AgentRunPort:
+        return resolve_agent_run_port(config)
 
-        No caching is used to avoid concurrency issues in multi-tenant scenarios.
-        """
-        return ConversationMemoryManager(
-            db_session=db_session,
-            thread_id=runtime.thread_id,
+    @staticmethod
+    def _run_scope(config: RunnableConfig, runtime: AgentRuntimeContext, agent_id: int) -> AgentRunScope:
+        run_id = config.get("configurable", {}).get("run_id")
+        if not run_id:
+            from apps.shared.core.exceptions import ValidationError
+
+            raise ValidationError("configurable.run_id is required for run scope")
+        return AgentRunScope(
             tenant_id=runtime.user.tenant_id,
-            agent_id=self.agent_config.agent_id,
-            run_id=run_id,
+            thread_id=runtime.thread_id,
+            run_id=str(run_id),
+            agent_id=agent_id,
         )
 
-    async def _load_history(self, state: AgentState, config: RunnableConfig) -> dict:
+    async def _cooperative_run_cancelled(self, state: AgentState, config: RunnableConfig) -> bool:
+        if state.get("run_cancelled"):
+            return True
+        run_id = config.get("configurable", {}).get("run_id")
+        if not run_id:
+            return False
+        port = resolve_agent_run_port(config)
+        return await port.is_run_cancelled(str(run_id))
+
+    def _build_cancelled_llm_update(
+        self,
+        state: AgentState,
+        *,
+        skill_state: SkillState,
+        loop_count: int,
+        current_messages: list[BaseMessage],
+    ) -> dict:
+        response = AIMessage(
+            id=str(uuid4()),
+            content="Generation was stopped.",
+            additional_kwargs={"timestamp": datetime.now(UTC).isoformat(), "run_cancelled": True},
+        )
+        return {
+            "messages": [*current_messages, response],
+            "loop_count": loop_count + 1,
+            "skill_state": skill_state,
+            "run_cancelled": True,
+        }
+
+    async def _load_history(self, state: AgentState, config: RunnableConfig | None = None) -> dict:
         """Load conversation history from database (first node in graph).
 
-        Multi-layer context loading:
+        Context loading:
         1. Parent context (if sub-agent)
-        2. Thread summaries
-        3. Session summaries
-        4. Recent messages
-        5. Current messages
+        2. Latest thread summary, recent main pairs, and this run's messages
+        3. Current turn messages
 
         Args:
             state: Current agent state with new user message
@@ -168,20 +197,23 @@ class AgentBase(ABC):
         """
         from langchain_core.messages import SystemMessage
 
+        assert config is not None
         if config.get("configurable", {}).get("skip_load_history"):
             self.logger.info("Skipping load_history (checkpoint resume)")
             return {}
 
+        if await self._cooperative_run_cancelled(state, config):
+            self.logger.info("Agent run cancelled before load_history for agent %s", self.agent_config.agent_name)
+            return {"run_cancelled": True}
+
         runtime = extract_runtime_context(config)
-        db_session = config.get("configurable", {}).get("db_session")
-        run_id = self._run_id_from_config(config)
-        manager = self._get_or_create_manager(runtime, db_session, run_id=run_id)
-        context_messages = []
+        configurable = config.get("configurable") or {}
+        context_messages: list = []
 
         # ============================================
         # Layer 1: Parent Context (if sub-agent)
         # ============================================
-        parent_context = config.get("configurable", {}).get("parent_context")
+        parent_context = configurable.get("parent_context")
         if parent_context and parent_context.get("summary"):
             context_messages.append(
                 SystemMessage(
@@ -194,29 +226,15 @@ class AgentBase(ABC):
             )
             self.logger.debug(f"Loaded parent context for agent {self.agent_config.agent_name}")
 
-        # ============================================
-        # Layer 2, 3 & 4: Thread Summaries + Session Summaries + Recent Messages
-        # ============================================
-        from apps.tenant_app_service.chat.service_base import (
-            DEFAULT_MAIN_TIMELINE_TURN_LIMIT,
-            RUN_HISTORY_MESSAGE_LIMIT,
+        run_id = configurable.get("run_id")
+        run_port = self._require_agent_run_port(config)
+        scope = self._run_scope(config, runtime, self.agent_config.agent_id)
+        historical_messages = await run_port.load_prompt_context(scope)
+
+        historical_messages = await run_port.hydrate_prompt_messages(
+            historical_messages,
+            tenant_id=runtime.tenant.tenant_id,
         )
-
-        historical_messages = await manager.load_messages_with_summary(
-            thread_summary_limit=1,
-            session_summary_limit=2,
-            main_timeline_turn_limit=DEFAULT_MAIN_TIMELINE_TURN_LIMIT,
-            run_message_limit=RUN_HISTORY_MESSAGE_LIMIT,
-        )
-
-        if db_session:
-            from apps.tenant_app_service.hitl.history import hydrate_hitl_history_messages
-
-            historical_messages = await hydrate_hitl_history_messages(
-                historical_messages,
-                tenant_id=runtime.tenant.tenant_id,
-                db=db_session,
-            )
 
         context_messages.extend(historical_messages)
 
@@ -230,7 +248,7 @@ class AgentBase(ABC):
             "context_load_turn_merge thread_id=%s run_id=%s session_id=%s agent=%s "
             "parent_context=%s historical=%s current_turn=%s combined=%s",
             runtime.thread_id,
-            run_id,
+            str(run_id) if run_id else None,
             runtime.session_id,
             self.agent_config.agent_name,
             bool(parent_context and parent_context.get("summary")),
@@ -288,7 +306,7 @@ class AgentBase(ABC):
 
         return system_messages
 
-    async def _llm_call(self, state: AgentState, config: RunnableConfig) -> dict:
+    async def _llm_call(self, state: AgentState, config: RunnableConfig | None = None) -> dict:
         """Call the LLM with automatic stats tracking and message management.
 
         This method handles:
@@ -305,12 +323,22 @@ class AgentBase(ABC):
         Returns:
             Updated state with LLM response and stats
         """
+        assert config is not None
         loop_count = state.get("loop_count", 0)
         tool_call_counts = state.get("tool_call_counts", {})
         runtime = extract_runtime_context(config)
         skill_state = self._get_skill_state(state, runtime)
         loaded_skills = skill_state.get("loaded_skills", [])
         current_messages = state["messages"]
+
+        if await self._cooperative_run_cancelled(state, config):
+            self.logger.info("Agent run cancelled before LLM call for agent %s", self.agent_config.agent_name)
+            return self._build_cancelled_llm_update(
+                state,
+                skill_state=skill_state,
+                loop_count=loop_count,
+                current_messages=current_messages,
+            )
 
         # init the vars incase exception happens
         start_time = time.time()
@@ -341,13 +369,38 @@ class AgentBase(ABC):
             tools = [] if tool_limit_finalize else self.agent_config.get_tools(loaded_skills, runtime)
 
             db_session = config.get("configurable", {}).get("db_session")
-            model_with_tools = await self._model_binding_manager.get_or_create(
-                model_profile_id=model_profile_id,
-                loaded_skills=loaded_skills,
-                tools=tools,
-                tenant_id=runtime.tenant.tenant_id,
-                db=db_session,
-                thinking_effort=thinking_effort,
+            configurable = config.get("configurable") or {}
+            run_id = configurable.get("run_id")
+
+            async def _with_graph_db(coro_factory):
+                if db_session is not None:
+                    return await coro_factory(db_session)
+                from apps.shared.db.session import app_db_session
+
+                async with app_db_session() as db:
+                    return await coro_factory(db)
+
+            if run_id and runtime.thread_id:
+                messages = await _with_graph_db(
+                    lambda db: compact_prepared_messages(
+                        messages,
+                        db=db,
+                        tenant_id=runtime.tenant.tenant_id,
+                        thread_id=runtime.thread_id,
+                        run_id=str(run_id),
+                        tools=tools,
+                        agent_run_port=resolve_agent_run_port(config),
+                    )
+                )
+            model_with_tools = await _with_graph_db(
+                lambda db: self._model_binding_manager.get_or_create(
+                    model_profile_id=model_profile_id,
+                    loaded_skills=loaded_skills,
+                    tools=tools,
+                    tenant_id=runtime.tenant.tenant_id,
+                    db=db,
+                    thinking_effort=thinking_effort,
+                )
             )
 
             response = None
@@ -409,7 +462,12 @@ class AgentBase(ABC):
         }
         return state_update
 
-    async def _tool_node(self, state: AgentState, config: RunnableConfig) -> dict:
+    async def _tool_node(self, state: AgentState, config: RunnableConfig | None = None) -> dict:
+        assert config is not None
+        if await self._cooperative_run_cancelled(state, config):
+            self.logger.info("Agent run cancelled before tool execution for agent %s", self.agent_config.agent_name)
+            return {"run_cancelled": True}
+
         last = state["messages"][-1]
         tool_calls = getattr(last, "tool_calls", None)
         results = []
@@ -607,12 +665,16 @@ class AgentBase(ABC):
     ) -> None:
         """Persist run-scoped messages (shared by save_messages and HITL interrupt)."""
         runtime = extract_runtime_context(config)
-        db_session = config.get("configurable", {}).get("db_session")
         run_id = self._run_id_from_config(config)
-        manager = self._get_or_create_manager(runtime, db_session, run_id=run_id)
+        run_port = self._require_agent_run_port(config)
         messages_to_save = state.get("messages", [])
         if messages_to_save:
-            await manager.add_messages(messages_to_save, config, deduplicate=True)
+            await run_port.persist_run_messages(
+                self._run_scope(config, runtime, self.agent_config.agent_id),
+                messages_to_save,
+                config,
+                deduplicate=True,
+            )
         if mark_awaiting_hitl:
             await self._pause_agent_run_for_hitl(config, run_id)
 
@@ -654,11 +716,10 @@ class AgentBase(ABC):
             )
         return True
 
-    async def _save_messages(self, state: AgentState, config: RunnableConfig) -> dict:
+    async def _save_messages(self, state: AgentState, config: RunnableConfig | None = None) -> dict:
         """Save all unsaved messages to database (executed after loop completes).
 
-        This node saves all messages from state["messages"].
-        The ConversationMemoryManager handles deduplication by message ID.
+        Run transcript persistence is delegated to ``AgentRunContextPort`` from config.
 
         Note: state["messages"] only contains conversation messages (not ephemeral system prompts).
         Ephemeral system prompts are created in _prepare_messages and never added to state.
@@ -670,19 +731,15 @@ class AgentBase(ABC):
         Returns:
             Empty dict (no state update needed)
         """
+        assert config is not None
         await self._persist_run_messages(state, config)
 
         return {}
 
     async def _pause_agent_run_for_hitl(self, config: RunnableConfig, run_id: str) -> None:
         """Mark the agent run paused for HITL after run messages are persisted."""
-        db_session = config.get("configurable", {}).get("db_session")
-        if not db_session:
-            return
-        from apps.tenant_app_service.chat.thread_run_service import ThreadRunService
-
-        runtime = extract_runtime_context(config)
-        await ThreadRunService(db_session, runtime.tenant.tenant_id).mark_run_awaiting_hitl(run_id)
+        port = resolve_agent_run_port(config)
+        await port.mark_run_awaiting_hitl(run_id)
 
     def _should_continue(self, state: AgentState) -> Literal["tool_node", "save_messages"]:
         """Determine if the agent should continue to tool execution or end.
@@ -697,6 +754,10 @@ class AgentBase(ABC):
         Returns:
             Next node to execute: "tool_node" or "save_messages"
         """
+        if state.get("run_cancelled"):
+            self.logger.info("Agent %s ending after user/run cancel", self.agent_config.agent_name)
+            return "save_messages"
+
         if state.get("tool_limit_blocked"):
             self.logger.info(
                 "Agent %s ending after tool-limit finalize LLM turn",

@@ -35,8 +35,10 @@ os.environ.pop("CHROMA_URL", None)
 
 
 def _isolate_parser_env() -> None:
-    os.environ["DOCUMENT_PARSER"] = "default"
-    os.environ.pop("DOCLING_SERVICE_URL", None)
+    from apps.shared.document.types import DEFAULT_DOCUMENT_PARSER
+
+    os.environ["DOCUMENT_PARSER"] = DEFAULT_DOCUMENT_PARSER
+    os.environ.setdefault("DOCLING_SERVICE_URL", "http://docling.test")
     os.environ.pop("DOCLING_API_KEY", None)
     os.environ.pop("DOCLING_DO_OCR", None)
     os.environ.pop("MINERU_SERVICE_URL", None)
@@ -47,6 +49,11 @@ _isolate_parser_env()
 def pytest_configure(config):
     """Configure pytest markers and options."""
     _isolate_parser_env()
+    config.addinivalue_line("filterwarnings", "ignore::sqlalchemy.exc.SADeprecationWarning")
+    config.addinivalue_line(
+        "filterwarnings",
+        "ignore::UserWarning:apps.tenant_app_service.agents.agent_base",
+    )
     config.addinivalue_line("markers", "unit: marks tests as unit tests (fast, no external dependencies)")
     config.addinivalue_line("markers", "integration: marks tests as integration tests (require running server)")
     config.addinivalue_line("markers", "slow: marks tests as slow running")
@@ -172,13 +179,38 @@ def runtime_context():
 @pytest.fixture
 def runnable_config(runtime_context):
     """Create test RunnableConfig with runtime context."""
+    from contextlib import asynccontextmanager
+
     from langchain_core.runnables import RunnableConfig
+
+    from apps.tenant_app_service.agents.ports.tool_hitl import HITL_ACTION_ALLOW, ToolHitlDecision
+
+    class _FakeAgentRunPort:
+        """Minimal port stub for tool tests (HITL allow only; no load/persist)."""
+
+        def evaluate_tool_approval(self, tool_config):
+            return ToolHitlDecision(action=HITL_ACTION_ALLOW, reason="test")
+
+        async def gate_tool_call(self, **kwargs):
+            return None, None
+
+        @asynccontextmanager
+        async def hitl_tool_execution_guard(self, proposal_id: str):
+            yield
+
+        async def mark_run_awaiting_hitl(self, run_id: str) -> None:
+            return None
+
+        async def is_run_cancelled(self, run_id: str) -> bool:
+            return False
 
     return RunnableConfig(
         configurable={
             "thread_id": runtime_context.thread_id,
             "runtime": runtime_context.model_dump(),
             "session_id": runtime_context.session_id,
+            "run_id": "00000000-0000-4000-8000-000000000099",
+            "agent_run_port": _FakeAgentRunPort(),
         }
     )
 

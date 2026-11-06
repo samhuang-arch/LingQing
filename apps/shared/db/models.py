@@ -17,6 +17,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from apps.shared.document.types import DEFAULT_DOCUMENT_PARSER
+
 
 class Base(DeclarativeBase):
     """Base class for all ORM models."""
@@ -714,6 +716,46 @@ class AgentRunMessage(Base):
     agent_run: Mapped["AgentRun"] = relationship("AgentRun", back_populates="run_messages")
 
 
+class AgentRunSummary(Base):
+    """In-run compress of an earlier prefix of one agent run. One row per run."""
+
+    __tablename__ = "agent_run_summaries"
+    __table_args__ = (Index("idx_agent_run_summaries_thread", "thread_id", "updated_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("agent_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    tenant_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False)
+    cutoff_message_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="LangChain message id of the last run message folded into summary_text",
+    )
+    through_agent_run_message_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="agent_run_messages.id of that cutoff when the row has been persisted",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
+
+
 class MessageFeedback(Base):
     """User rating (thumbs up/down) for an AI chat message."""
 
@@ -906,6 +948,11 @@ class ThreadSummary(Base):
         Integer, nullable=False, comment="Total tokens before summarization"
     )
     token_count_after: Mapped[int] = mapped_column(Integer, nullable=False, comment="Token count of the summary itself")
+    through_trigger_message_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Newest main-line human trigger included in this cumulative summary",
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -2507,13 +2554,13 @@ class ResourceIndex(Base):
         comment="Parent resource id (collection_id for documents, data_source_id for assets, connector_id for api_operations)",
     )
 
-    # Source parser that generated raw_content (e.g., "default", "docling", "mineru")
+    # Source parser that generated raw_content (docling, mineru; legacy "default" normalized at read)
     source_parser: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        default="default",
-        server_default="default",
-        comment="Parser used to generate raw_content: default, docling, mineru, etc.",
+        default=DEFAULT_DOCUMENT_PARSER,
+        server_default=DEFAULT_DOCUMENT_PARSER,
+        comment="Parser used to generate raw_content: docling, mineru, etc.",
     )
 
     # Raw structured content from parser (source of truth)

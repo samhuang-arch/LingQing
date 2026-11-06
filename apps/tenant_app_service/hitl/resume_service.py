@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import AsyncIterator
 
@@ -9,7 +10,6 @@ from apps.shared.db.models import Agent
 from apps.shared.db.session import app_db_session
 from apps.shared.schemas.user import UserDTO
 from apps.shared.utils.logger import get_logger
-from apps.tenant_app_service.chat.agent_run_repository import AgentRunRepository
 from apps.tenant_app_service.chat.schemas import ChatRequest, SimpleMessage
 from apps.tenant_app_service.chat.thread_run_service import ThreadRunService
 from apps.tenant_app_service.chat.turn_service import ChatTurnService
@@ -49,13 +49,15 @@ class HitlResumeService:
         if approval.requested_by != current_user.id:
             return None
 
-        run_repo = AgentRunRepository(self.db)
-        run = await run_repo.get_by_session_id(approval.session_id) if approval.session_id else None
+        thread_runs = ThreadRunService(self.db, self.tenant_id)
+        run = (
+            await thread_runs.get_run_by_session_id(approval.session_id)
+            if approval.session_id
+            else None
+        )
         if not run:
             logger.warning("HITL resume: no agent run for session_id=%s", approval.session_id)
             return None
-
-        thread_runs = ThreadRunService(self.db, self.tenant_id)
         if not await thread_runs.on_resume_started(run.id):
             logger.info(
                 "HITL resume skipped (run not awaiting_hitl): proposal_id=%s run_id=%s",
@@ -92,23 +94,33 @@ class HitlResumeService:
         *,
         current_user: UserDTO,
     ) -> AsyncIterator[str]:
-        async with app_db_session() as db:
-            turn = ChatTurnService(self.tenant_id, db)
-            request = ChatRequest(
-                tenant_id=self.tenant_id,
-                agent_id=ctx.agent_id,
-                thread_id=ctx.thread_id,
-                message=SimpleMessage(role="human", content=""),
-            )
-            async for payload in turn.run_hitl_checkpoint_resume_stream(
-                request=request,
-                current_user=current_user,
-                session_id=ctx.session_id,
-                agent_id=ctx.agent_id,
-                agent_name=ctx.agent_name,
-                run_id=ctx.run_id,
-                trigger_message_id=ctx.trigger_message_id,
-                invoke_index=ctx.invoke_index,
-                proposal_id=ctx.proposal_id,
-            ):
-                yield payload
+        from apps.tenant_app_service.chat.agent_run_execution_registry import register, unregister
+
+        run_id = ctx.run_id
+        current = asyncio.current_task()
+        if run_id and current is not None:
+            register(run_id, current)
+        try:
+            async with app_db_session() as db:
+                turn = ChatTurnService(self.tenant_id, db)
+                request = ChatRequest(
+                    tenant_id=self.tenant_id,
+                    agent_id=ctx.agent_id,
+                    thread_id=ctx.thread_id,
+                    message=SimpleMessage(role="human", content=""),
+                )
+                async for payload in turn.run_hitl_checkpoint_resume_stream(
+                    request=request,
+                    current_user=current_user,
+                    session_id=ctx.session_id,
+                    agent_id=ctx.agent_id,
+                    agent_name=ctx.agent_name,
+                    run_id=ctx.run_id,
+                    trigger_message_id=ctx.trigger_message_id,
+                    invoke_index=ctx.invoke_index,
+                    proposal_id=ctx.proposal_id,
+                ):
+                    yield payload
+        finally:
+            if run_id:
+                unregister(run_id)

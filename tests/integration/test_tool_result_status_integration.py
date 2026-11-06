@@ -17,7 +17,7 @@ from sqlalchemy.pool import NullPool
 from apps.shared.db.models import ChatThread, Tenant, TenantMembership, User
 from apps.shared.db.session import get_db
 from apps.shared.schemas.user import UserDTO
-from apps.tenant_app_service.agents.memory.conversation_memory_manager import ConversationMemoryManager
+from apps.tenant_app_service.chat.conversation_memory_manager import ConversationMemoryManager
 from apps.tenant_app_service.agents.tool_executor import ToolExecutor
 from apps.tenant_app_service.agents.tools import ToolResult
 from apps.tenant_app_service.agents.tools.tool_result import (
@@ -224,7 +224,7 @@ async def test_executor_limit_persisted_and_visible_in_history(
     sample_tenant_user_thread,
 ):
     """ToolExecutor → ConversationMemoryManager → ThreadService history."""
-    from apps.tenant_app_service.chat.agent_run_repository import AgentRunRepository
+    from apps.tenant_app_service.chat.infrastructure.persistence.agent_run_repository import AgentRunRepository
 
     thread, tenant_id, user_id = sample_tenant_user_thread
     session_id = f"sess-exec-{uuid4().hex[:8]}"
@@ -251,6 +251,8 @@ async def test_executor_limit_persisted_and_visible_in_history(
     agent_config.get_tool_config.return_value = mock_tool_config
     agent_config.has_skills.return_value = False
 
+    from apps.tenant_app_service.chat.agent_run_port_adapter import chat_agent_run_port_for_run
+
     executor = ToolExecutor(agent_config, "test_agent")
     config = RunnableConfig(
         configurable={
@@ -258,6 +260,11 @@ async def test_executor_limit_persisted_and_visible_in_history(
             "session_id": session_id,
             "run_id": run.id,
             "db_session": pg_async_db_session,
+            "agent_run_port": chat_agent_run_port_for_run(
+                tenant_id=tenant_id,
+                agent_id=thread.agent_id,
+                run_id=run.id,
+            ),
             "runtime": {
                 "tenant": {"tenant_id": tenant_id, "tenant_name": "Integration Tenant", "config": {}},
                 "user": {

@@ -40,26 +40,27 @@ async def test_reject_persists_ai_ack_without_tool_message_mutation():
     run_message_repo.get_messages_by_session = AsyncMock(return_value=[])
     run_domain = MagicMock(id="run-1")
 
+    mock_run_service = MagicMock()
+    mock_run_service.get_run_by_session_id = AsyncMock(return_value=run_domain)
+    mock_run_service.mark_run_completed = AsyncMock()
+    mock_run_service.finalize_run_for_main = AsyncMock()
+
     with (
         patch(
-            "apps.tenant_app_service.chat.agent_run_message_repository.AgentRunMessageRepository",
+            "apps.tenant_app_service.hitl.service._agent_run_message_repository",
             return_value=run_message_repo,
         ),
         patch(
-            "apps.tenant_app_service.chat.agent_run_repository.AgentRunRepository"
-        ) as run_repo_cls,
+            "apps.tenant_app_service.hitl.service._thread_run_service_for_session",
+            return_value=mock_run_service,
+        ),
         patch(
-            "apps.tenant_app_service.agents.memory.conversation_memory_manager.ConversationMemoryManager"
-        ) as manager_cls,
-        patch(
-            "apps.tenant_app_service.chat.thread_run_service.ThreadRunService"
-        ) as run_service_cls,
+            "apps.tenant_app_service.chat.infrastructure.adapters.agent_run_port_adapter"
+            ".chat_agent_run_port_for_run",
+        ) as run_port_factory,
     ):
-        run_repo_cls.return_value.get_by_session_id = AsyncMock(return_value=run_domain)
-        run_repo_cls.return_value.set_status = AsyncMock()
-        run_service_cls.return_value.finalize_run_for_main = AsyncMock()
-        manager = manager_cls.return_value
-        manager.add_messages = AsyncMock()
+        run_port = run_port_factory.return_value
+        run_port.persist_run_messages = AsyncMock()
 
         result = await service.reject(
             proposal_id="hitl_abc",
@@ -70,9 +71,9 @@ async def test_reject_persists_ai_ack_without_tool_message_mutation():
     assert result.status == HITL_STATUS_REJECTED
     assert result.needs_agent_resume is False
     assert result.ack_message == build_hitl_rejected_ai_message("hitl_test_echo")
-    manager.add_messages.assert_awaited_once()
-    run_repo_cls.return_value.set_status.assert_awaited_once()
-    run_service_cls.return_value.finalize_run_for_main.assert_awaited_once_with("run-1")
+    run_port.persist_run_messages.assert_awaited_once()
+    mock_run_service.mark_run_completed.assert_awaited_once_with("run-1")
+    mock_run_service.finalize_run_for_main.assert_awaited_once_with("run-1")
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,8 @@
-"""Chat **Application** layer (orchestration): multi-session use-case entry points.
+"""Chat application layer — use cases (orchestration + session-scoped).
 
-Composes Application Services (``ChatTurnService``, etc.) across committed DB sessions.
-Routers and ingress import from here — not session-scoped services directly for streaming.
-See ``AGENTS.md`` (Application vs Application Services) and ``turn_flow`` module docstring.
+- ``turn_flow`` / ``headless_flow`` — multi-session entry points
+- ``turn/``, ``runs/``, ``threads/`` — session-scoped use case modules
+- ``queries/`` — history read-model helpers
 """
 
 from apps.tenant_app_service.chat.application.headless_flow import run_headless_chat_turn

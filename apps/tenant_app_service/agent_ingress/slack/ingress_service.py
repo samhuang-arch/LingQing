@@ -37,9 +37,11 @@ from apps.tenant_app_service.agent_ingress.slack.messages import (
     slack_user_message,
 )
 from apps.tenant_app_service.agent_ingress.slack.repository import SlackRepository
+from apps.tenant_app_service.agent_ingress.slack.run_control_blocks import build_thinking_placeholder_blocks
 from apps.tenant_app_service.auth.repository import UserRepository
 from apps.tenant_app_service.auth.token import JwtTokenIssuer
 from apps.tenant_app_service.chat.schemas import ChatRequest, SimpleMessage
+from apps.tenant_app_service.chat.streaming import PreparedChatStream
 from apps.tenant_app_service.chat.thread_service import ThreadService
 
 logger = get_logger(__name__)
@@ -115,10 +117,20 @@ class SlackIngressService:
             return
         thread_id, agent_id = resolved
 
+        # prepare/complete chat turns open their own committed sessions; persist the
+        # Slack→chat thread mapping first so FK inserts can see chat_threads.
+        await self.db.commit()
+
         message_text = strip_bot_mention(event.text, event.bot_user_id) if event.source == "app_mention" else event.text
         if not message_text.strip():
             await self._post_ephemeral(bot_token, event, slack_user_message(SlackMessageKey.EMPTY_MENTION_MESSAGE))
             return
+
+        reply_thread_ts = slack_reply_thread_ts(
+            channel_type=event.channel_type,
+            thread_ts=event.thread_ts,
+            message_ts=event.ts,
+        )
 
         user_dto, tenant_name = await self._build_user_dto(tenant_id, result.user_id)
         if user_dto is None:
@@ -133,12 +145,6 @@ class SlackIngressService:
             tenant_name=tenant_name,
         )
 
-        reply_thread_ts = slack_reply_thread_ts(
-            channel_type=event.channel_type,
-            thread_ts=event.thread_ts,
-            message_ts=event.ts,
-        )
-
         chat_request = ChatRequest(
             tenant_id=tenant_id,
             agent_id=agent_id,
@@ -146,12 +152,19 @@ class SlackIngressService:
             thread_id=thread_id,
         )
 
-        async def _post_thinking() -> str | None:
+        async def _post_thinking(prepared: PreparedChatStream) -> str | None:
+            thinking_text = slack_user_message(SlackMessageKey.THINKING_PLACEHOLDER)
+            blocks = (
+                build_thinking_placeholder_blocks(thinking_text=thinking_text, run_id=prepared.run_id)
+                if prepared.run_id
+                else None
+            )
             thinking = await self.client.chat_post_message(
                 bot_token=bot_token,
                 channel=event.channel_id,
-                text=slack_user_message(SlackMessageKey.THINKING_PLACEHOLDER),
+                text=thinking_text,
                 thread_ts=reply_thread_ts,
+                blocks=blocks,
             )
             return thinking.get("ts") if thinking else None
 
@@ -181,7 +194,7 @@ class SlackIngressService:
             session_id=session_id,
             thread_id=thread_id,
         )
-        await post_slack_reply_with_feedback(
+        delivery_kwargs = dict(
             client=self.client,
             bot_token=bot_token,
             channel_id=event.channel_id,
@@ -199,6 +212,15 @@ class SlackIngressService:
             requester_role=user_dto.role,
             agent_id=agent_id,
         )
+        try:
+            await post_slack_reply_with_feedback(**delivery_kwargs)
+        except Exception:
+            logger.exception(
+                "Slack reply delivery failed for thread %s session %s; retrying once",
+                thread_id,
+                session_id,
+            )
+            await post_slack_reply_with_feedback(**delivery_kwargs)
 
     async def _get_endpoint(self, endpoint_id: int) -> AgentIngressEndpoint | None:
         result = await self.db.execute(select(AgentIngressEndpoint).where(AgentIngressEndpoint.id == endpoint_id))

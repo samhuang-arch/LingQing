@@ -1,0 +1,648 @@
+"""Conversation memory manager for optimized message storage and retrieval.
+
+This module provides efficient message management with:
+- Run-scoped storage in agent_run_messages; human/promoted AI on thread_main_messages
+- LangChain message format conversion
+- Context assembly: latest thread summary, main timeline, and this run's messages
+"""
+
+import json
+from datetime import UTC, datetime
+
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langchain_core.runnables import RunnableConfig
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from apps.shared.db.models import AgentRunMessage, ChatMessage, ChatThread
+from apps.shared.utils.logger import get_logger
+from apps.tenant_app_service.agents.context import extract_runtime_context
+from apps.tenant_app_service.agents.message_content import normalize_message_content
+from apps.tenant_app_service.agents.message_persistence_adapters import (
+    agent_run_message_to_chat_message,
+    agent_run_message_to_langchain,
+    thread_main_message_domain_to_langchain,
+)
+
+
+def _serialize_additional_kwargs(kwargs: dict | None) -> dict | None:
+    """Serialize additional_kwargs for JSON storage, converting non-serializable objects.
+
+    Recursively cleans the entire kwargs dict to ensure JSON compatibility:
+    - Normalizes empty 'arguments' strings to '{}' (for tool_calls)
+    - Converts non-serializable objects to strings
+    - Handles nested dicts and lists
+
+    Args:
+        kwargs: The additional_kwargs dictionary to serialize
+
+    Returns:
+        A JSON-serializable dictionary
+    """
+    if not kwargs:
+        return kwargs
+
+    return _ensure_json_serializable(kwargs)
+
+
+def _ensure_json_serializable(value):
+    """Recursively ensure a value is JSON-serializable.
+
+    Handles:
+    - Empty 'arguments' string -> normalize to '{}' (for tool_calls)
+    - Non-serializable objects -> convert to string
+    - Nested structures -> recursive cleaning
+
+    Args:
+        value: Any Python value to make JSON-serializable
+
+    Returns:
+        JSON-serializable version of the value
+    """
+    # Handle None
+    if value is None:
+        return None
+
+    # Handle dicts recursively
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, val in value.items():
+            # Special case: normalize empty 'arguments' to valid JSON
+            if key == "arguments" and val == "":
+                cleaned[key] = "{}"
+            else:
+                cleaned[key] = _ensure_json_serializable(val)
+        return cleaned
+
+    # Handle lists recursively
+    if isinstance(value, list):
+        return [_ensure_json_serializable(item) for item in value]
+
+    # Handle primitives - try to serialize, convert to string if fails
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _count_main_timeline_roles(messages: list[BaseMessage]) -> tuple[int, int]:
+    human = sum(1 for m in messages if isinstance(m, HumanMessage))
+    ai = sum(1 for m in messages if isinstance(m, AIMessage))
+    return human, ai
+
+
+def _count_run_row_types(rows: list[AgentRunMessage]) -> dict[str, int]:
+    counts: dict[str, int] = {"human": 0, "ai": 0, "tool": 0}
+    for row in rows:
+        key = row.type if row.type in counts else "other"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _context_message_refs(messages: list[BaseMessage]) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    for msg in messages:
+        msg_id = msg.id or "?"
+        if isinstance(msg, SystemMessage):
+            summary_kind = (msg.additional_kwargs or {}).get("summary_type")
+            kind = f"system:{summary_kind}" if summary_kind else "system"
+            refs.append({"id": msg_id, "type": kind})
+        else:
+            refs.append({"id": msg_id, "type": getattr(msg, "type", msg.__class__.__name__)})
+    return refs
+
+
+def _cumulative_watermark(summary: object) -> str | None:
+    """Trigger message id on a cumulative thread summary. Legacy rows have none."""
+    value = getattr(summary, "through_trigger_message_id", None)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+class ConversationMemoryManager:
+    """Load and persist agent run messages; assemble LLM context from main + run stores."""
+
+    def __init__(
+        self,
+        db_session: AsyncSession,
+        thread_id: str,
+        tenant_id: int,
+        agent_id: int,
+        run_id: str,
+    ):
+        """Initialize memory manager scoped to one agent run.
+
+        Args:
+            db_session: Database session for message operations
+            thread_id: Thread ID for this conversation
+            tenant_id: Tenant ID for tenant-scoped repos
+            agent_id: Agent ID for context isolation
+            run_id: Agent run ID for run-scoped message persistence
+        """
+        self.db = db_session
+        self.thread_id = thread_id
+        self.tenant_id = tenant_id
+        self.agent_id = agent_id
+        self.run_id = run_id
+        self.logger = get_logger(__name__)
+        # Lazy import to avoid circular dependency
+        from apps.tenant_app_service.chat.application.runs.thread_run_service import ThreadRunService
+        from apps.tenant_app_service.chat.infrastructure.persistence import (
+            AgentRunMessageRepository,
+            MainMessageRepository,
+            ThreadSummaryRepository,
+        )
+
+        self.run_message_repo = AgentRunMessageRepository(db_session)
+        self.main_message_repo = MainMessageRepository(db_session)
+        self.thread_summary_repo = ThreadSummaryRepository(db_session)
+        self._thread_runs = ThreadRunService(db_session, tenant_id)
+
+        self.logger.info(
+            f"Initialized ConversationMemoryManager for thread {thread_id} "
+            f"(tenant_id={tenant_id}, agent_id={agent_id}, run_id={run_id})"
+        )
+
+    def _extract_message_timestamp(self, kwargs: dict) -> datetime:
+        """Extract and parse message timestamp from kwargs, with fallback to current time.
+
+        Removes 'timestamp' from kwargs if present.
+
+        Priority:
+        1. If timestamp exists in kwargs:
+           - Parse as datetime if string (ISO 8601 format)
+           - Return as-is if already datetime
+        2. Fallback to current UTC time
+
+        Args:
+            kwargs: Message additional_kwargs dict (will be modified to remove 'timestamp')
+
+        Returns:
+            Parsed datetime object (UTC)
+        """
+        timestamp_value = kwargs.get("timestamp", None)
+
+        if not timestamp_value:
+            return datetime.now(UTC)
+
+        # If already a datetime object, return as-is
+        if isinstance(timestamp_value, datetime):
+            return timestamp_value
+
+        # If string, try to parse as ISO 8601
+        if isinstance(timestamp_value, str):
+            try:
+                return datetime.fromisoformat(timestamp_value)
+            except (ValueError, TypeError):
+                self.logger.warning(f"Invalid timestamp format: {timestamp_value}, using current time")
+                return datetime.now(UTC)
+
+        # Unexpected type, use current time
+        self.logger.warning(f"Unexpected timestamp type: {type(timestamp_value)}, using current time")
+        return datetime.now(UTC)
+
+    def _extract_message_metadata(self, kwargs: dict, cap_context: dict) -> dict:
+        """Extract message metadata from kwargs and capability context.
+
+        Removes metadata keys from kwargs and merges with capability context.
+
+        Args:
+            kwargs: Message additional_kwargs dict (will be modified to remove metadata keys)
+            cap_context: Capability call context from runtime config
+
+        Returns:
+            Extracted metadata dictionary
+        """
+        from apps.tenant_app_service.agents.message_metadata import pop_message_metadata_from_kwargs
+
+        metadata = pop_message_metadata_from_kwargs(kwargs)
+
+        # Merge capability context
+        if cap_context:
+            metadata = {
+                **metadata,
+                "visibility": "internal",
+                "capability_id": cap_context.get("capability_id"),
+                "capability_name": cap_context.get("capability_name"),
+            }
+
+        return metadata
+
+    async def _preprocess_messages(
+        self, raw_messages: list[BaseMessage], deduplicate: bool = True
+    ) -> list[BaseMessage]:
+        """Preprocess messages: filter, deduplicate, and validate.
+
+        Steps:
+        1. Filter out SystemMessages (context/instructions, not conversation)
+        2. Deduplicate: check which messages already exist in database
+        3. Return ready-to-save messages
+
+        Args:
+            raw_messages: Raw LangChain messages to process
+            deduplicate: If True, filter out duplicate messages
+
+        Returns:
+            Filtered and deduplicated messages ready for saving
+        """
+        if not raw_messages:
+            return []
+
+        # Step 1: Filter out SystemMessages and human rows (persisted on main timeline for runs)
+        messages_to_process = [
+            msg for msg in raw_messages if not isinstance(msg, SystemMessage) and not isinstance(msg, HumanMessage)
+        ]
+
+        if len(messages_to_process) < len(raw_messages):
+            skipped = len(raw_messages) - len(messages_to_process)
+            self.logger.debug(f"Skipped {skipped} SystemMessage(s) - not persisting to database")
+
+        if not messages_to_process:
+            self.logger.debug("No messages to save after filtering SystemMessages")
+            return []
+
+        # Step 2: Deduplicate
+        if not deduplicate:
+            return messages_to_process
+
+        existing_message_ids = set()
+        message_ids_to_check = [msg.id for msg in messages_to_process if msg.id]
+
+        if message_ids_to_check:
+            existing_messages = await self.run_message_repo.get_messages_by_ids(message_ids_to_check)
+            existing_message_ids = {msg.message_id for msg in existing_messages if msg.message_id}
+
+        # Filter out existing messages
+        messages_to_save = [msg for msg in messages_to_process if msg.id not in existing_message_ids]
+
+        if len(messages_to_save) < len(messages_to_process):
+            self.logger.debug(f"Skipped {len(messages_to_process) - len(messages_to_save)} duplicate messages")
+
+        if not messages_to_save:
+            self.logger.debug("No new messages to add after deduplication")
+
+        return messages_to_save
+
+    async def _is_tool_chain_resolved(self, anchor: ChatMessage) -> bool:
+        """Check whether an anchor AI tool-call chain is fully complete."""
+        from apps.tenant_app_service.chat.domain import extract_tool_call_ids, is_tool_chain_resolved
+        from apps.tenant_app_service.hitl.history import is_hitl_proposal_blocking
+        from apps.tenant_app_service.hitl.utils import get_hitl_proposal_id, is_hitl_skipped_sibling_message
+
+        tool_call_ids = extract_tool_call_ids(anchor.tool_calls)
+        if not tool_call_ids or not anchor.session_id:
+            return False
+
+        last_tool_msg_id: int | None = None
+        resolved_tool_call_ids: set[str] = set()
+        terminal_hitl_only = True
+        for tool_call_id in tool_call_ids:
+            run_tool = await self.run_message_repo.get_tool_message_by_call_id(
+                self.thread_id, tool_call_id, run_id=self.run_id
+            )
+            tool_msg = agent_run_message_to_chat_message(run_tool) if run_tool is not None else None
+            if tool_msg is None:
+                return False
+
+            proposal_id = get_hitl_proposal_id(tool_msg)
+            if proposal_id:
+                if await is_hitl_proposal_blocking(
+                    proposal_id,
+                    tenant_id=self.tenant_id,
+                    db=self.db,
+                ):
+                    return False
+                resolved_tool_call_ids.add(tool_call_id)
+                terminal_hitl_only = True
+                continue
+
+            if is_hitl_skipped_sibling_message(tool_msg):
+                return False
+
+            terminal_hitl_only = False
+            resolved_tool_call_ids.add(tool_call_id)
+            if last_tool_msg_id is None or tool_msg.id > last_tool_msg_id:
+                last_tool_msg_id = tool_msg.id
+
+        if last_tool_msg_id is None:
+            if resolved_tool_call_ids.issuperset(tool_call_ids) and terminal_hitl_only:
+                return True
+            return False
+
+        has_final_ai = await self.run_message_repo.has_ai_message_after_db_id_in_session(
+            self.thread_id,
+            self.agent_id,
+            last_tool_msg_id,
+            anchor.session_id,
+        )
+        if terminal_hitl_only and resolved_tool_call_ids.issuperset(tool_call_ids):
+            return True
+        return is_tool_chain_resolved(tool_call_ids, resolved_tool_call_ids, has_final_ai)
+
+    async def _ensure_hitl_context_run(self, db_messages: list[AgentRunMessage]) -> tuple[list[AgentRunMessage], int]:
+        """HITL tail injection for this ``run_id`` only (not other parallel agent runs).
+
+        Returns:
+            Merged run rows and count of rows added beyond the input slice.
+        """
+        last_ai_msg = await self.run_message_repo.get_last_ai_message_with_tool_calls(self.run_id, self.agent_id)
+        if not last_ai_msg:
+            return db_messages, 0
+        anchor = agent_run_message_to_chat_message(last_ai_msg)
+        if await self._is_tool_chain_resolved(anchor):
+            return db_messages, 0
+        loaded_ids = {msg.id for msg in db_messages}
+        if last_ai_msg.id in loaded_ids:
+            return db_messages, 0
+        tail_messages = await self.run_message_repo.get_messages_from_db_id(
+            run_id=self.run_id,
+            agent_id=self.agent_id,
+            from_db_id=last_ai_msg.id,
+        )
+        if not tail_messages:
+            return db_messages, 0
+        tail_id_set = {msg.id for msg in tail_messages}
+        merged = tail_messages + [msg for msg in db_messages if msg.id not in tail_id_set]
+        merged.sort(key=lambda m: (m.created_at, m.id))
+        return merged, max(0, len(merged) - len(db_messages))
+
+    def _log_context_load_manifest(
+        self,
+        *,
+        main_timeline_turn_limit: int | None,
+        run_message_limit: int | None,
+        thread_summary_count: int,
+        main_messages: list[BaseMessage],
+        run_rows_pre_hitl: int,
+        run_rows_after_hitl: list[AgentRunMessage],
+        run_rows_appended: list[AgentRunMessage],
+        run_deduped_from_main: int,
+        hitl_injected_rows: int,
+        final_messages: list[BaseMessage],
+    ) -> None:
+        main_human, main_ai = _count_main_timeline_roles(main_messages)
+        run_appended_counts = _count_run_row_types(run_rows_appended)
+        self.logger.info(
+            "context_load_manifest thread_id=%s run_id=%s agent_id=%s "
+            "limits main_turns=%s run_messages=%s "
+            "loaded thread_summary_count=%s "
+            "main_human=%s main_ai=%s run_pre_hitl=%s run_after_hitl=%s "
+            "run_appended_human=%s run_appended_ai=%s run_appended_tool=%s "
+            "run_deduped_from_main=%s hitl_injected_rows=%s total_messages=%s",
+            self.thread_id,
+            self.run_id,
+            self.agent_id,
+            main_timeline_turn_limit,
+            run_message_limit,
+            thread_summary_count,
+            main_human,
+            main_ai,
+            run_rows_pre_hitl,
+            len(run_rows_after_hitl),
+            run_appended_counts.get("human", 0),
+            run_appended_counts.get("ai", 0),
+            run_appended_counts.get("tool", 0),
+            run_deduped_from_main,
+            hitl_injected_rows,
+            len(final_messages),
+        )
+        self.logger.debug(
+            "context_load_message_refs thread_id=%s run_id=%s refs=%s",
+            self.thread_id,
+            self.run_id,
+            json.dumps(_context_message_refs(final_messages)),
+        )
+
+    async def _load_thread_summary_messages(self) -> tuple[list[BaseMessage], str | None]:
+        """Latest cumulative status only. Older versions are already inside that text."""
+        thread_summaries = await self.thread_summary_repo.get_recent_summaries(self.thread_id, limit=1)
+        if not thread_summaries:
+            return [], None
+
+        latest = thread_summaries[0]
+        messages = [
+            SystemMessage(
+                content=latest.summary_content,
+                additional_kwargs={
+                    "summary_type": "thread_summary",
+                    "summary_version": latest.version,
+                },
+            )
+        ]
+        return messages, _cumulative_watermark(latest)
+
+    async def _load_current_trigger_human_message(
+        self,
+        trigger_message_id: str | None,
+    ) -> BaseMessage | None:
+        if not trigger_message_id:
+            return None
+        row = await self.main_message_repo.get_by_message_id(self.thread_id, trigger_message_id)
+        if row is None or row.type != "human":
+            return None
+        return thread_main_message_domain_to_langchain(row)
+
+    async def _load_main_timeline_messages(
+        self,
+        *,
+        turn_limit: int | None,
+        exclude_trigger_message_id: str | None,
+        through_trigger_message_id: str | None = None,
+    ) -> list[BaseMessage]:
+        from apps.tenant_app_service.chat.domain import (
+            exclude_trigger_human_from_main_rows,
+            select_main_pairs_with_watermark,
+            sort_timeline_trigger_anchored,
+        )
+        from apps.tenant_app_service.chat.service_base import DEFAULT_MAIN_TIMELINE_TURN_LIMIT
+
+        main_rows = await self.main_message_repo.list_for_thread(self.thread_id)
+        main_rows = sort_timeline_trigger_anchored(main_rows)
+        main_rows = exclude_trigger_human_from_main_rows(
+            main_rows,
+            trigger_message_id=exclude_trigger_message_id,
+        )
+        reserve = turn_limit
+        if through_trigger_message_id and reserve is None:
+            reserve = DEFAULT_MAIN_TIMELINE_TURN_LIMIT
+        main_rows = select_main_pairs_with_watermark(
+            main_rows,
+            agent_id=self.agent_id,
+            through_trigger_message_id=through_trigger_message_id,
+            reserve_tail=reserve,
+        )
+        return [thread_main_message_domain_to_langchain(row) for row in main_rows]
+
+    async def _load_agent_run_messages(
+        self,
+        *,
+        run_message_limit: int | None,
+    ) -> tuple[list[AgentRunMessage], int, int]:
+        from apps.tenant_app_service.chat.domain import drop_run_rows_duplicating_promoted_main
+
+        promoted_main = await self.main_message_repo.get_promoted_ai_for_run(self.run_id)
+        promoted_message_id = promoted_main.message_id if promoted_main else None
+
+        raw_run_messages = await self.run_message_repo.get_unsummarized_messages(
+            run_id=self.run_id,
+            agent_id=self.agent_id,
+            limit=run_message_limit,
+        )
+        raw_run_messages.reverse()
+        raw_run_messages = drop_run_rows_duplicating_promoted_main(
+            raw_run_messages,
+            promoted_main_message_id=promoted_message_id,
+        )
+        pre_hitl_count = len(raw_run_messages)
+        merged, hitl_injected = await self._ensure_hitl_context_run(raw_run_messages)
+        return merged, hitl_injected, pre_hitl_count
+
+    async def load_messages_with_summary(
+        self,
+        *,
+        main_timeline_turn_limit: int | None = None,
+        run_message_limit: int | None = None,
+    ) -> list[BaseMessage]:
+        """Load messages for one agent run.
+
+        Strategy:
+        1. Load the latest thread summary. A cumulative row (``through_trigger_message_id``)
+           keeps the last N main pairs verbatim and omits only older pairs already covered.
+           A row with no watermark keeps the last N main pairs beside the summary text.
+        2. Append the active trigger human, then this run's ``agent_run_messages``.
+           In-run compression is applied later, on each model call.
+        3. HITL guarantee: the open tool chain is always present.
+
+        Args:
+            main_timeline_turn_limit: Last K human + promoted-AI **turns** on main
+                after summary filtering. ``None`` = no cap.
+            run_message_limit: Max unsummarized run rows for this ``run_id``.
+                ``None`` = all unsummarized; ``0`` = none.
+
+        Returns:
+            List of LangChain messages:
+            [latest thread summary] + [main history pairs] + [current trigger human]
+            + [current run messages]
+        """
+        # Check thread exists
+        thread = await self.db.get(ChatThread, self.thread_id)
+        if not thread:
+            self.logger.warning(f"Thread {self.thread_id} not found")
+            return []
+
+        run = await self._thread_runs.get_run(self.run_id)
+        trigger_message_id = run.trigger_message_id if run else None
+
+        messages: list[BaseMessage] = []
+
+        thread_msgs, thread_watermark = await self._load_thread_summary_messages()
+        messages.extend(thread_msgs)
+
+        main_messages = await self._load_main_timeline_messages(
+            turn_limit=main_timeline_turn_limit,
+            exclude_trigger_message_id=trigger_message_id,
+            through_trigger_message_id=thread_watermark,
+        )
+        messages.extend(main_messages)
+
+        trigger_human = await self._load_current_trigger_human_message(trigger_message_id)
+        if trigger_human is not None:
+            messages.append(trigger_human)
+
+        raw_run_messages, hitl_injected_rows, run_rows_pre_hitl = await self._load_agent_run_messages(
+            run_message_limit=run_message_limit
+        )
+        main_ai_ids = {m.id for m in messages if isinstance(m, AIMessage) and m.id is not None}
+        run_deduped_from_main = 0
+        run_rows_appended: list[AgentRunMessage] = []
+        for msg in raw_run_messages:
+            if msg.type == "ai" and msg.message_id and msg.message_id in main_ai_ids:
+                run_deduped_from_main += 1
+                continue
+            run_rows_appended.append(msg)
+            messages.append(agent_run_message_to_langchain(msg))
+
+        thread_summary_count = 1 if thread_msgs else 0
+        self._log_context_load_manifest(
+            main_timeline_turn_limit=main_timeline_turn_limit,
+            run_message_limit=run_message_limit,
+            thread_summary_count=thread_summary_count,
+            main_messages=main_messages,
+            run_rows_pre_hitl=run_rows_pre_hitl,
+            run_rows_after_hitl=raw_run_messages,
+            run_rows_appended=run_rows_appended,
+            run_deduped_from_main=run_deduped_from_main,
+            hitl_injected_rows=hitl_injected_rows,
+            final_messages=messages,
+        )
+        return messages
+
+    async def add_messages(
+        self,
+        raw_messages: list[BaseMessage],
+        config: RunnableConfig,
+        deduplicate: bool = True,
+    ) -> None:
+        """Add new messages and immediately save to database.
+
+        This method preprocesses messages (filter, deduplicate) and persists run rows.
+
+        Args:
+            raw_messages: List of new LangChain messages to add
+            config: Runtime configuration
+            deduplicate: If True, skip messages with IDs that already exist
+        """
+        # Preprocess: filter and deduplicate messages
+        messages_to_save = await self._preprocess_messages(raw_messages, deduplicate)
+        if not messages_to_save:
+            return
+
+        # Get thread
+        thread = await self.db.get(ChatThread, self.thread_id)
+        if not thread:
+            self.logger.warning(f"Thread {self.thread_id} not found, cannot add messages")
+            return
+
+        cap_context = config.get("configurable", {}).get("capability_call_context", {})
+        runtime_context = extract_runtime_context(config)
+
+        run_rows: list[AgentRunMessage] = []
+        for msg in messages_to_save:
+            message_id = msg.id
+            kwargs = msg.additional_kwargs or {}
+            kwargs = _serialize_additional_kwargs(kwargs)
+            msg_timestamp = self._extract_message_timestamp(kwargs)
+            metadata = self._extract_message_metadata(kwargs, cap_context)
+            if msg.type == "tool" and hasattr(msg, "tool_call_id"):
+                kwargs = {**(kwargs or {}), "tool_call_id": msg.tool_call_id}
+            tool_calls = None
+            if msg.type == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
+                tool_calls = _serialize_additional_kwargs(msg.tool_calls)
+            if msg.type == "ai":
+                content = normalize_message_content(msg.content)
+            else:
+                content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+            run_rows.append(
+                AgentRunMessage(
+                    message_id=message_id,
+                    run_id=self.run_id,
+                    thread_id=self.thread_id,
+                    type=msg.type,
+                    content=content,
+                    timestamp=msg_timestamp,
+                    is_summarized=False,
+                    tool_calls=tool_calls,
+                    additional_kwargs=kwargs,
+                    session_id=runtime_context.session_id,
+                    agent_id=runtime_context.agent_id,
+                    message_metadata=metadata,
+                )
+            )
+        await self.run_message_repo.save_messages_batch(run_rows)
+        self.logger.info(f"Added {len(run_rows)} run messages to run {self.run_id}")
