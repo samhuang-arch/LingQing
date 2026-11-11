@@ -1,6 +1,6 @@
 {
   "version": "v1",
-  "generated_at": "2026-11-05T13:36:26.189602+00:00",
+  "generated_at": "2026-11-10T04:05:23.312112+00:00",
   "components": {
     "schemas": {
       "AclShareCandidateResponse": {
@@ -7298,6 +7298,11 @@
             "type": "boolean",
             "title": "Enabled"
           },
+          "channel_chat_enabled": {
+            "type": "boolean",
+            "title": "Channel Chat Enabled",
+            "default": true
+          },
           "endpoint_key": {
             "type": "string",
             "title": "Endpoint Key"
@@ -7400,7 +7405,7 @@
             "anyOf": [
               {
                 "type": "string",
-                "maxLength": 2000
+                "maxLength": 1000
               },
               {
                 "type": "null"
@@ -8557,6 +8562,18 @@
               }
             ],
             "title": "Enabled"
+          },
+          "channel_chat_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Chat Enabled",
+            "description": "Answer @mentions in channels, private channels, and group DMs. Omit to leave unchanged."
           }
         },
         "type": "object",
