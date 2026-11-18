@@ -1,6 +1,6 @@
 """Domain-specific exceptions for business logic layer.
 
-Service layer raises these exceptions, API layer converts them to HTTPException.
+Domain and application code raise these; presentation maps them to HTTP responses (see exception_handlers).
 """
 
 
@@ -45,6 +45,12 @@ class AuthenticationError(DomainException):
 
 class AuthorizationError(DomainException):
     """Authorization failed (403)."""
+
+    pass
+
+
+class IntegrationNotConnectedError(DomainException):
+    """User-mode integration has no active user credential binding (422)."""
 
     pass
 

@@ -18,7 +18,7 @@ Local development details → [dev-guide.md](../dev-guide.md). Repo layout → [
 | Tier | Target | Compose | Env file | Command |
 | --- | --- | --- | --- | --- |
 | **dev** | Laptop | `compose/local/infra.yml` | `.env.local` | `./deploy/scripts/local-stack.sh infra-up` |
-| **e2e** | Laptop | `compose/local/full-stack.yml` | `.env.e2e` | `./deploy/scripts/local-stack.sh stack-up` |
+| **e2e** | Laptop | `compose/local/full-stack.yml` | `deploy/env/.env.e2e` | `./deploy/scripts/local-stack.sh stack-up` |
 | **remote** | Remote VM | release bundle or `remote/stack.yml` | `.env` / `.env.prod` | `./bootstrap.sh` or `./deploy/scripts/remote/deploy.sh …` |
 
 Staging and production use the **same** remote stack on **separate VMs**; only `.env` differs.
@@ -46,10 +46,10 @@ Staging and production use the **same** remote stack on **separate VMs**; only `
 
 ```bash
 # Build + deploy
-./deploy/scripts/remote/release.sh user@vm ghcr.io/org/lingqing .env.prod v2.0.0 all
+./deploy/scripts/remote/release.sh user@vm ghcr.io/org/lingqing .env.prod vX.Y.Z all
 
 # Deploy only (images already in registry)
-./deploy/scripts/remote/deploy.sh v2.0.0 ghcr.io/org/lingqing vm deploy .env.prod all
+./deploy/scripts/remote/deploy.sh vX.Y.Z ghcr.io/org/lingqing vm deploy .env.prod all
 ```
 
 ---
@@ -74,14 +74,16 @@ Full Docker stack on laptop — no registry or SSH.
 cp deploy/env/.env.template deploy/env/.env.e2e
 # Edit .env.e2e: TENANT_APP_DB_HOST=postgres, TENANT_APP_DB_PORT=5432, CHROMA_URL=http://chroma:8000, …
 
-./deploy/scripts/local-stack.sh stack-up
+./deploy/scripts/local-stack.sh stack-up   # builds images, runs Postgres init, starts services
 ./deploy/scripts/local-stack.sh smoke
 
-TENANT_APP_DB_HOST=localhost TENANT_APP_DB_PORT=5433 npm run migrate-db:ta
+# First tenant from laptop (Postgres published on host 5433; backends already ran Alembic via entrypoint)
 TENANT_APP_DB_HOST=localhost TENANT_APP_DB_PORT=5433 npm run tenant-cli -- create --name "Demo" --slug demo
 ```
 
-Host ports are fixed in `full-stack.yml` (Postgres `5433`, gateway `18080`). See [deploy/README.md](../../deploy/README.md#e2e-host-ports-fixed-in-compose).
+Host ports are fixed in `full-stack.yml` (Postgres `5433`, gateway `18080`). Map `app-test.example.com` and `manager-test.example.com` to `127.0.0.1`, then open `http://app-test.example.com:18080`. See [deploy/README.md](../../deploy/README.md#e2e-host-ports-fixed-in-compose).
+
+Host `npm run migrate-db:ta` is for debugging against E2E Postgres only; you normally skip it after `stack-up`.
 
 ---
 
@@ -119,10 +121,10 @@ Full variable reference: [reference.md](reference.md).
 
 #### Option A — Release bundle on VM (recommended, no repo clone)
 
-Each semver tag publishes `lingqing-deploy-vX.Y.Z.tar.gz` on GitHub Releases (includes `init_db.sh`, `.env.template`, `bootstrap.sh`):
+Each semver tag publishes `lingqing-deploy-vX.Y.Z.tar.gz` on GitHub Releases (includes `init_db.sh`, `.env.template`, `bootstrap.sh`). Examples below use `foxty/LingQing`; substitute your org, repo, and registry:
 
 ```bash
-VERSION=v2.0.0
+VERSION=vX.Y.Z
 curl -fsSL "https://github.com/foxty/LingQing/releases/download/${VERSION}/lingqing-deploy-${VERSION}.tar.gz" | tar -xz
 cd "lingqing-deploy-${VERSION}"
 
@@ -137,7 +139,7 @@ cp .env.template .env && nano .env   # fill "FILL BEFORE DEPLOY" section
 **Upgrade** (from the bundle directory):
 
 ```bash
-./bootstrap.sh --version v2.1.0 --registry ghcr.io/foxty/lingqing
+./bootstrap.sh --version vX.Y.Z --registry ghcr.io/foxty/lingqing
 ```
 
 ### Daily staging images
@@ -148,7 +150,7 @@ Daily builds from `main` publish GHCR tags **`daily-YYYY-MM-DD`** (immutable) an
 | --- | --- |
 | Try latest daily | `./bootstrap.sh --version daily --registry ghcr.io/foxty/lingqing` |
 | Pin a specific day (rollback) | `./bootstrap.sh --version daily-2026-10-02 --registry ghcr.io/foxty/lingqing` |
-| Production | semver only, e.g. `v1.0.2` |
+| Production | semver only, e.g. `v0.0.3` |
 
 Daily images are built only when `main` has commits in the last 24 hours (`.github/workflows/schedule-daily.yml`). Each run also checks for `daily-*` tags older than 14 days and prunes them when found.
 
@@ -166,13 +168,13 @@ When images already exist in the registry:
 
 ```bash
 ./deploy/scripts/generate-env.sh deploy/env/.env.template /tmp/.env.prod
-./deploy/scripts/remote/deploy.sh v2.0.0 ghcr.io/foxty/lingqing your-vm deploy /tmp/.env.prod all
+./deploy/scripts/remote/deploy.sh vX.Y.Z ghcr.io/foxty/lingqing your-vm deploy /tmp/.env.prod all
 ```
 
 #### Option C — `release.sh` (build locally + deploy)
 
 ```bash
-./deploy/scripts/remote/release.sh user@your-vm ghcr.io/yourorg/lingqing .env.prod v2.0.0 all
+./deploy/scripts/remote/release.sh user@your-vm ghcr.io/yourorg/lingqing .env.prod vX.Y.Z all
 ```
 
 Use when customizing images. For published GHCR tags, prefer Option A or B.
@@ -213,7 +215,7 @@ Login: `admin@demo` / `admin` — change immediately in production.
 - [ ] Unique `SECRET_KEY`
 - [ ] `TENANT_APP_DB_SSL_MODE=require` (and manager DB if separate)
 - [ ] `APP_PUBLIC_URL` and `MANAGER_PUBLIC_URL` set in `.env`
-- [ ] Change default `admin` / `admin` password
+- [ ] Change default `admin@<slug>` / `admin` password
 - [ ] Backups for Postgres + `DATA_ROOT_HOST_PATH` (include `chroma/` for vector DB files)
 - [ ] LLM keys configured per tenant in Settings
 - [ ] Firewall: only 443/80 public

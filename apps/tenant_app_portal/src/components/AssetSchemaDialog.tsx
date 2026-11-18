@@ -27,7 +27,7 @@ import {
 } from '@/lib/dataSourceApi'
 import { useEffect, useMemo, useState } from 'react'
 import { useNotification } from '@/hooks/useNotification'
-import { formatDate } from '@/lib/dateTime'
+import { useFormatUserDateTime } from '@/hooks/useUserDateTimeFormat'
 
 i18n.addResourceBundle('en', 'translation', {
   components: {
@@ -90,6 +90,8 @@ interface AssetSchemaDialogProps {
   onOpenChange: (open: boolean) => void
   asset: AssetMetadata
   onUpdated?: (asset: AssetMetadata) => void
+  /** When true, hide schema metadata editing (read-only catalog access). */
+  readOnly?: boolean
 }
 
 export default function AssetSchemaDialog({
@@ -97,8 +99,10 @@ export default function AssetSchemaDialog({
   onOpenChange,
   asset,
   onUpdated,
+  readOnly = false,
 }: AssetSchemaDialogProps) {
   const { t } = useTranslation()
+  const formatUserDateTime = useFormatUserDateTime()
   const columns = asset.columns || []
   const sourceInfo = asset.source_info || {}
   const { showSuccess, showError } = useNotification()
@@ -186,22 +190,24 @@ export default function AssetSchemaDialog({
               <Database className="w-5 h-5" />
                {t('components.assetSchemaDialog.title')}
             </span>
-            <div className="flex items-center gap-2">
-              {isEditing ? (
-                <>
-                  <Button variant="outline" size="sm" onClick={() => setIsEditing(false)} disabled={isSaving}>
-                    {t('components.assetSchemaDialog.cancel')}
+            {!readOnly ? (
+              <div className="flex items-center gap-2">
+                {isEditing ? (
+                  <>
+                    <Button variant="outline" size="sm" onClick={() => setIsEditing(false)} disabled={isSaving}>
+                      {t('components.assetSchemaDialog.cancel')}
+                    </Button>
+                    <Button size="sm" onClick={handleSave} disabled={isSaving}>
+                      {isSaving ? t('common.loading') : t('components.assetSchemaDialog.save')}
+                    </Button>
+                  </>
+                ) : (
+                  <Button size="sm" variant="outline" onClick={() => setIsEditing(true)}>
+                    {t('components.assetSchemaDialog.edit')}
                   </Button>
-                  <Button size="sm" onClick={handleSave} disabled={isSaving}>
-                    {isSaving ? t('common.loading') : t('components.assetSchemaDialog.save')}
-                  </Button>
-                </>
-              ) : (
-                <Button size="sm" variant="outline" onClick={() => setIsEditing(true)}>
-                  {t('components.assetSchemaDialog.edit')}
-                </Button>
-              )}
-            </div>
+                )}
+              </div>
+            ) : null}
           </DialogTitle>
           <DialogDescription>
             <Trans i18nKey="components.assetSchemaDialog.assetDescription" values={{ name: asset.asset_name }} />
@@ -229,7 +235,7 @@ export default function AssetSchemaDialog({
             </div>
             <div>
               <p className="text-xs text-muted-foreground mb-1">{t('components.assetSchemaDialog.createdAt')}</p>
-              <p className="text-sm font-medium">{formatDate(asset.created_at)}</p>
+              <p className="text-sm font-medium">{formatUserDateTime(asset.created_at)}</p>
             </div>
           </div>
 

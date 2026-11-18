@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from apps.shared.core.auth import get_current_user
-from apps.shared.data_source.schemas import RAGSourceType
+from apps.shared.external_systems.data_source.schemas import RAGSourceType
 from apps.shared.db.models import DataSource, Document, DocumentCollection, Tenant, User
 from apps.shared.db.session import get_db
 from apps.shared.tasks.domain import TaskExecutionContext
@@ -34,8 +34,8 @@ from apps.shared.infra.rag.rag_manager import RAGManager
 from apps.shared.infra.storage.file_storage import LocalFileStorage
 from apps.shared.schemas.user import UserDTO
 from apps.shared.search.domain import VectorStatus
-from apps.shared.search.indexing_service import ResourceIndexService
-from apps.shared.search.search_service import SearchService
+from apps.shared.search.sync_service import ResourceIndexService
+from apps.shared.search.retrieval_service import SearchService
 from apps.shared.tasks.system.jobs.document_parse import run_document_parse_jobs
 from apps.shared.tasks.system.jobs.vector_sync import cleanup_orphaned_vectors, sync_to_vector_db
 from apps.tenant_app_service.routers.documents import get_file_storage_dependency
