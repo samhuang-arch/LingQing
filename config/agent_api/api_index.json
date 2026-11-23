@@ -1,6 +1,6 @@
 {
   "version": "v1",
-  "generated_at": "2026-11-16T11:43:52.392949+00:00",
+  "generated_at": "2026-11-20T08:48:11.725056+00:00",
   "operations": [
     {
       "operation_key": "DELETE_/acl-shares/{resource_type}/{resource_id}/shares/{user_id}",
@@ -33,6 +33,11 @@
       "risk_level": "write"
     },
     {
+      "operation_key": "DELETE_/api-connectors/{connector_id}/connections/users/{user_id}",
+      "summary": "Admin Delete User Api Connector Connection",
+      "risk_level": "write"
+    },
+    {
       "operation_key": "DELETE_/dashboards/{dashboard_id}",
       "summary": "Delete Dashboard",
       "risk_level": "write"
@@ -50,6 +55,11 @@
     {
       "operation_key": "DELETE_/data-sources/{data_source_id}/connections/me",
       "summary": "Delete My Data Source Connection",
+      "risk_level": "write"
+    },
+    {
+      "operation_key": "DELETE_/data-sources/{data_source_id}/connections/users/{user_id}",
+      "summary": "Admin Delete User Data Source Connection",
       "risk_level": "write"
     },
     {
@@ -198,8 +208,18 @@
       "risk_level": "read"
     },
     {
+      "operation_key": "GET_/api-connectors/{connector_id}/connections",
+      "summary": "List Api Connector Connections",
+      "risk_level": "read"
+    },
+    {
       "operation_key": "GET_/api-connectors/{connector_id}/connections/me",
       "summary": "Get My Api Connector Connection",
+      "risk_level": "read"
+    },
+    {
+      "operation_key": "GET_/api-connectors/{connector_id}/connections/users/{user_id}",
+      "summary": "Get User Api Connector Connection",
       "risk_level": "read"
     },
     {
@@ -263,6 +283,21 @@
       "risk_level": "read"
     },
     {
+      "operation_key": "GET_/audit/event-types",
+      "summary": "List Audit Event Types",
+      "risk_level": "read"
+    },
+    {
+      "operation_key": "GET_/audit/events",
+      "summary": "List Audit Events",
+      "risk_level": "read"
+    },
+    {
+      "operation_key": "GET_/audit/events/export",
+      "summary": "Export Audit Events",
+      "risk_level": "read"
+    },
+    {
       "operation_key": "GET_/charts/{chart_id}/image.{extension}",
       "summary": "Get Chart Image",
       "risk_level": "read"
@@ -303,8 +338,18 @@
       "risk_level": "read"
     },
     {
+      "operation_key": "GET_/data-sources/{data_source_id}/connections",
+      "summary": "List Data Source Connections",
+      "risk_level": "read"
+    },
+    {
       "operation_key": "GET_/data-sources/{data_source_id}/connections/me",
       "summary": "Get My Data Source Connection",
+      "risk_level": "read"
+    },
+    {
+      "operation_key": "GET_/data-sources/{data_source_id}/connections/users/{user_id}",
+      "summary": "Get User Data Source Connection",
       "risk_level": "read"
     },
     {
@@ -628,6 +673,11 @@
       "risk_level": "write"
     },
     {
+      "operation_key": "POST_/api-connectors/{connector_id}/connections/users/{user_id}/test",
+      "summary": "Admin Test User Api Connector Connection",
+      "risk_level": "write"
+    },
+    {
       "operation_key": "POST_/api-connectors/{connector_id}/operations",
       "summary": "Add Manual Operation",
       "risk_level": "write"
@@ -705,6 +755,11 @@
     {
       "operation_key": "POST_/data-sources/{data_source_id}/connections/me/test",
       "summary": "Test My Data Source Connection",
+      "risk_level": "write"
+    },
+    {
+      "operation_key": "POST_/data-sources/{data_source_id}/connections/users/{user_id}/test",
+      "summary": "Admin Test User Data Source Connection",
       "risk_level": "write"
     },
     {
@@ -828,6 +883,11 @@
       "risk_level": "write"
     },
     {
+      "operation_key": "PUT_/api-connectors/{connector_id}/connections/users/{user_id}",
+      "summary": "Admin Upsert User Api Connector Connection",
+      "risk_level": "write"
+    },
+    {
       "operation_key": "PUT_/dashboards/{dashboard_id}",
       "summary": "Update Dashboard by ID",
       "risk_level": "write"
@@ -835,6 +895,11 @@
     {
       "operation_key": "PUT_/data-sources/{data_source_id}/connections/me",
       "summary": "Upsert My Data Source Connection",
+      "risk_level": "write"
+    },
+    {
+      "operation_key": "PUT_/data-sources/{data_source_id}/connections/users/{user_id}",
+      "summary": "Admin Upsert User Data Source Connection",
       "risk_level": "write"
     },
     {
