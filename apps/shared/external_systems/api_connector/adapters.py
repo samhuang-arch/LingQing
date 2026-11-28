@@ -8,6 +8,10 @@ from typing import Any
 from pydantic import BaseModel
 
 from apps.shared.db.models import ApiConnector, ApiOperationIndex
+from apps.shared.external_systems.api_connector.auth_config_secrets_policy import (
+    decrypt_auth_config_from_storage,
+    redact_auth_config_for_api,
+)
 from apps.shared.external_systems.api_connector.constants import (
     AUTH_TYPE_API_KEY,
     AUTH_TYPE_BASIC,
@@ -35,14 +39,8 @@ from apps.shared.external_systems.api_connector.schemas import (
     ApiOperationResponse,
     ApiRatePolicySchema,
 )
-from apps.shared.external_systems.api_connector.sensitive_config import (
-    AUTH_CONFIG_ROOT,
-    AUTH_CONFIG_SENSITIVE_FIELDS,
-    AUTH_CONFIG_SENSITIVE_LEAF_KEYS,
-)
 from apps.shared.external_systems.domain.types import effective_credential_mode
 from apps.shared.utils.field_cipher import FieldCipher
-from apps.shared.utils.sensitive_redaction import collect_stored_secret_paths
 
 
 def auth_config_to_dict(auth_config: Any) -> dict[str, Any]:
@@ -147,7 +145,7 @@ def connector_entity_to_domain(
     else:
         raw_auth_config = connector.auth_config or {}
         if cipher and raw_auth_config:
-            decrypted_dict = cipher.decrypt_dict(raw_auth_config, sensitive_fields=AUTH_CONFIG_SENSITIVE_FIELDS)
+            decrypted_dict = decrypt_auth_config_from_storage(raw_auth_config, cipher=cipher)
         else:
             decrypted_dict = raw_auth_config
 
@@ -171,6 +169,7 @@ def connector_entity_to_domain(
         status=connector.status,
         credential_mode=effective_credential_mode(connector.credential_mode),
         pack_ref=connector.pack_ref,
+        agent_instructions=connector.agent_instructions,
         execution_rules=ExecutionRulesDomain.from_raw(connector.execution_rules),
         created_at=connector.created_at,
         updated_at=connector.updated_at,
@@ -222,12 +221,7 @@ def connector_domain_to_response(connector: ApiConnectorDomain) -> ApiConnectorR
     """
     auth_config_dict = auth_config_to_dict(connector.auth_config)
 
-    masked_fields = collect_stored_secret_paths(
-        auth_config_dict,
-        root_prefix=AUTH_CONFIG_ROOT,
-        sensitive_leaf_keys=AUTH_CONFIG_SENSITIVE_LEAF_KEYS,
-    )
-    masked_auth_config = FieldCipher.mask_dict(auth_config_dict, sensitive_fields=AUTH_CONFIG_SENSITIVE_FIELDS)
+    masked_auth_config, masked_fields = redact_auth_config_for_api(auth_config_dict)
 
     return ApiConnectorResponse(
         id=connector.id,
@@ -242,6 +236,7 @@ def connector_domain_to_response(connector: ApiConnectorDomain) -> ApiConnectorR
         rate_policy=ApiRatePolicySchema.from_domain(connector.rate_policy),
         execution_rules=ApiExecutionRulesSchema(**connector.execution_rules.to_dict()),
         pack_ref=connector.pack_ref,
+        agent_instructions=connector.agent_instructions,
         schema_source_type=connector.schema_source_type,
         schema_source_url=connector.schema_source_url,
         schema_metadata=connector.schema_metadata,

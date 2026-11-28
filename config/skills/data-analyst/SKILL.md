@@ -12,28 +12,28 @@ description: |
 
   DO NOT USE when:
   - User asks about non-data topics (general Q&A, coding, document search without data context)
-  - Request is purely about API operations (use api_connector skill)
+  - Request is purely about API operations (use search_apis / call_external_api)
   - User wants to modify/delete data (this skill is read-only)
   - User wants a persistent BI dashboard (use dashboard-builder)
 metadata:
   owner: platform
 tools:
   - name: search_data_assets
-    limit: 10
+    limit: 15
   - name: search_documents
-    limit: 10
+    limit: 15
   - name: retrieve_resource_context
-    limit: 10
+    limit: 15
   - name: run_sql_query_on_datasource
-    limit: 30
+    limit: 99
   - name: create_chart_from_sql
-    limit: 10
+    limit: 15
   - name: create_chart_from_structured_data
-    limit: 10
+    limit: 15
   - name: create_chart_grid_from_sql
-    limit: 10
+    limit: 15
   - name: create_chart_grid_from_structured_data
-    limit: 10
+    limit: 15
 ---
 
 ## Responsibilities

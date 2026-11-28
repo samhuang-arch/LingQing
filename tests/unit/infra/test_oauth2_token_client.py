@@ -29,12 +29,19 @@ class _Config:
 
 
 class _FakeResponse:
-    def __init__(self, *, status: int, payload: dict):
+    def __init__(self, *, status: int, payload: dict | None = None, text: str | None = None, content_type: str = "application/json"):
         self.status = status
-        self._payload = payload
+        self._payload = payload or {}
+        self._text = text
+        self.headers = {"Content-Type": content_type}
 
     async def json(self, content_type=None):
         return self._payload
+
+    async def text(self):
+        if self._text is not None:
+            return self._text
+        return ""
 
     async def __aenter__(self):
         return self
@@ -49,8 +56,13 @@ class _FakeSession:
     def __init__(self, *args, **kwargs):
         pass
 
-    def post(self, url, data=None, auth=None):
-        type(self).last_post = {"url": url, "data": dict(data or {}), "auth": auth}
+    def post(self, url, data=None, auth=None, headers=None):
+        type(self).last_post = {
+            "url": url,
+            "data": dict(data or {}),
+            "auth": auth,
+            "headers": dict(headers or {}),
+        }
         return _FakeResponse(status=self._status, payload=self._payload)
 
     async def __aenter__(self):
@@ -103,6 +115,63 @@ async def test_exchange_code_reads_nested_slack_authed_user_path(monkeypatch):
     assert session_cls.last_post["data"]["grant_type"] == "authorization_code"
     assert session_cls.last_post["data"]["client_secret"] == "synthetic-secret"
     assert session_cls.last_post["auth"] is None
+    assert session_cls.last_post["headers"]["Accept"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_refresh_parses_form_urlencoded_token_response(monkeypatch):
+    class _FormResponse(_FakeResponse):
+        def __init__(self):
+            super().__init__(
+                status=200,
+                text="access_token=form-access&token_type=Bearer&expires_in=3600",
+                content_type="application/x-www-form-urlencoded; charset=utf-8",
+            )
+
+    class _FormSession(_FakeSession):
+        _status = 200
+        _payload = {}
+
+        def post(self, url, data=None, auth=None, headers=None):
+            type(self).last_post = {"url": url, "data": dict(data or {}), "auth": auth, "headers": dict(headers or {})}
+            return _FormResponse()
+
+    monkeypatch.setattr("apps.shared.infra.oauth.client.aiohttp.ClientSession", _FormSession)
+
+    tokens = await OAuth2TokenClient().refresh(
+        config=_Config(),
+        refresh_token="refresh-token",
+    )
+    assert tokens.access_token == "form-access"
+
+
+@pytest.mark.asyncio
+async def test_refresh_raises_on_form_urlencoded_provider_error(monkeypatch):
+    class _FormErrorResponse(_FakeResponse):
+        def __init__(self):
+            super().__init__(
+                status=200,
+                text=(
+                    "error=bad_refresh_token"
+                    "&error_description=The+refresh+token+passed+is+incorrect+or+expired."
+                ),
+                content_type="application/x-www-form-urlencoded; charset=utf-8",
+            )
+
+    class _FormErrorSession(_FakeSession):
+        _status = 200
+        _payload = {}
+
+        def post(self, url, data=None, auth=None, headers=None):
+            return _FormErrorResponse()
+
+    monkeypatch.setattr("apps.shared.infra.oauth.client.aiohttp.ClientSession", _FormErrorSession)
+
+    with pytest.raises(ValidationError, match="bad_refresh_token"):
+        await OAuth2TokenClient().refresh(
+            config=_Config(),
+            refresh_token="stale-refresh",
+        )
 
 
 @pytest.mark.asyncio
@@ -159,7 +228,7 @@ async def test_exchange_raises_on_http_error_status(monkeypatch):
 @pytest.mark.asyncio
 async def test_exchange_maps_transport_error_to_validation_error(monkeypatch):
     class _FailingSession(_FakeSession):
-        def post(self, url, data=None, auth=None):
+        def post(self, url, data=None, auth=None, headers=None):
             raise aiohttp.ClientConnectionError("synthetic connection failure")
 
     monkeypatch.setattr("apps.shared.infra.oauth.client.aiohttp.ClientSession", _FailingSession)

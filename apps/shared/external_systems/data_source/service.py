@@ -6,7 +6,6 @@ Handles CRUD operations for tenant data sources and assets including:
 - CSV uploads and queries
 """
 
-from copy import deepcopy
 from dataclasses import dataclass
 
 import pandas as pd
@@ -50,6 +49,10 @@ from apps.shared.external_systems.data_source.catalog_sync import (
     CatalogSyncCredentials,
     strip_user_mode_connection_template,
 )
+from apps.shared.external_systems.data_source.config_secrets_policy import (
+    decrypt_data_source_config_from_storage,
+    prepare_data_source_config_for_storage,
+)
 from apps.shared.external_systems.data_source.domain import DataSourceDomain
 from apps.shared.external_systems.data_source.schemas import (
     DataSourceCreate,
@@ -57,6 +60,10 @@ from apps.shared.external_systems.data_source.schemas import (
     DataSourceUpdate,
     DiscoveredAsset,
     TestConnectionResponse,
+)
+from apps.shared.external_systems.data_source.user_oauth import (
+    merge_user_oauth_into_config,
+    validate_databricks_user_oauth_settings,
 )
 from apps.shared.external_systems.domain.types import (
     CREDENTIAL_MODE_USER,
@@ -448,14 +455,30 @@ class DataSourceService(TenantAwareService):
             credential_mode or (entity.credential_mode if entity else None)
         )
         if config is not None:
-            base = dict(entity.config or {}) if entity else {}
+            base = (
+                decrypt_data_source_config_from_storage(entity.config or {})
+                if entity
+                else {}
+            )
             merged = CatalogSyncCredentials.merge_incoming_into_config(base, config)
+            merged = merge_user_oauth_into_config(base, merged)
             if mode == CREDENTIAL_MODE_USER:
                 config = strip_user_mode_connection_template(merged)
             else:
                 config = merged
         elif mode == CREDENTIAL_MODE_USER and entity and entity.config:
-            config = strip_user_mode_connection_template(entity.config)
+            config = strip_user_mode_connection_template(
+                decrypt_data_source_config_from_storage(entity.config)
+            )
+
+        validate_databricks_user_oauth_settings(
+            data_source_type=(entity.type if entity else DataSourceType.POSTGRES),
+            credential_mode=mode,
+            managed=entity.managed if entity else True,
+            config=config if config is not None else (entity.config if entity else {}),
+        )
+        if config is not None:
+            config = prepare_data_source_config_for_storage(config)
 
         updated = await self.data_source_repo.update_fields(
             data_source_id=data_source_id,
@@ -616,7 +639,8 @@ class DataSourceService(TenantAwareService):
             raise ValidationError(
                 "Per-user data sources require metadata_sync credentials for catalog sync and discovery.",
             )
-        connection = domain_entity.connection_config_for_metadata_sync(entity.config or {})
+        decrypted_config = decrypt_data_source_config_from_storage(entity.config or {})
+        connection = domain_entity.connection_config_for_metadata_sync(decrypted_config)
         domain = db_data_source_to_domain_with_connection(entity, connection)
         if domain.tenant_id != self.tenant_id:
             raise AuthorizationError(f"Data source {data_source_id} does not belong to tenant {self.tenant_id}")
@@ -654,6 +678,13 @@ class DataSourceService(TenantAwareService):
         credential_mode = effective_credential_mode(data_source_data.credential_mode)
         if credential_mode == CREDENTIAL_MODE_USER:
             config = strip_user_mode_connection_template(config)
+        validate_databricks_user_oauth_settings(
+            data_source_type=data_source_data.type,
+            credential_mode=credential_mode,
+            managed=data_source_data.managed,
+            config=config,
+        )
+        config = prepare_data_source_config_for_storage(config)
 
         data_source = await self.data_source_repo.create_from_domain(
             tenant_id=self.tenant_id,
@@ -823,7 +854,7 @@ class DataSourceService(TenantAwareService):
         if entity.managed:
             raise ValidationError("Platform-managed data sources cannot be tested with this endpoint.")
 
-        merged = deepcopy(entity.config or {})
+        merged = decrypt_data_source_config_from_storage(entity.config or {})
         if config_overlay:
             merged = CatalogSyncCredentials.merge_incoming_into_config(merged, config_overlay)
 

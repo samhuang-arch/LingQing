@@ -39,6 +39,7 @@ from apps.shared.external_systems.domain.types import (
     CredentialModeStr,
     UserConnectionStatus,
 )
+from apps.shared.external_systems.oauth.dtos import IntegrationOAuthStartResponse
 from apps.shared.schemas.masked_fields import MaskedFieldsMixin
 from apps.shared.schemas.pagination import PaginatedResponse
 
@@ -203,6 +204,7 @@ class ApiConnectorResponse(MaskedFieldsMixin):
     rate_policy: ApiRatePolicySchema
     execution_rules: ApiExecutionRulesSchema = Field(default_factory=ApiExecutionRulesSchema)
     pack_ref: str | None = None
+    agent_instructions: str | None = None
     schema_source_type: SchemaSourceType
     schema_source_url: str | None
     schema_metadata: dict[str, Any]
@@ -226,8 +228,8 @@ class SyncSchemaRequest(BaseModel):
     file_content: str | None = None
 
 
-class ApiConnectorOAuthStartResponse(BaseModel):
-    authorization_url: str
+# Stable OpenAPI component name (same shape as integration kernel DTO).
+ApiConnectorOAuthStartResponse = IntegrationOAuthStartResponse
 
 
 class SyncSchemaSummaryDTO(BaseModel):
